@@ -96,7 +96,7 @@ async function validateIpAccess(app, orgId, clientIp, userRole = null) {
 /**
  * Fastify plugin for IP validation middleware
  */
-async function ipValidationPlugin(app) {
+async function ipValidationPlugin(app, options) {
   // Add IP validation method to app instance
   app.decorate('validateIpAccess', validateIpAccess.bind(null, app));
   app.decorate('getClientIp', getClientIp);
@@ -174,5 +174,9 @@ async function ipValidationPlugin(app) {
     }
   });
 }
+
+// Add Fastify plugin metadata
+ipValidationPlugin[Symbol.for('skip-override')] = true;
+ipValidationPlugin[Symbol.for('fastify.display-name')] = 'ip-validation';
 
 export { ipValidationPlugin, getClientIp, validateIpAccess };

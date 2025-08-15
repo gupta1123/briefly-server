@@ -244,7 +244,7 @@ export function registerRoutes(app) {
   });
 
   // Organization settings (persist UI and security preferences)
-  app.get('/orgs/:orgId/settings', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.get('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { data, error } = await db
@@ -264,7 +264,7 @@ export function registerRoutes(app) {
     };
   });
 
-  app.put('/orgs/:orgId/settings', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.put('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Ensure only org admins can update
@@ -326,7 +326,7 @@ export function registerRoutes(app) {
     return { orgId: org.id, name: org.name, role: 'orgAdmin' };
   });
 
-  app.get('/orgs/:orgId/users', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.get('/orgs/:orgId/users', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Only org admin can list members
@@ -389,7 +389,7 @@ export function registerRoutes(app) {
   });
 
   // Invite/create a user and add to org with optional expiry
-  app.post('/orgs/:orgId/users', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.post('/orgs/:orgId/users', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Only org admin can invite
@@ -453,7 +453,7 @@ export function registerRoutes(app) {
   });
 
   // Remove a user from the organization (does not delete auth account)
-  app.delete('/orgs/:orgId/users/:userId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.delete('/orgs/:orgId/users/:userId', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { userId } = req.params;
@@ -504,7 +504,7 @@ export function registerRoutes(app) {
     };
   });
 
-  app.post('/orgs/:orgId/audit/login', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.post('/orgs/:orgId/audit/login', { preHandler: app.verifyAuth }, async (req) => {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const clientIp = app.getClientIp(req);
@@ -608,7 +608,7 @@ export function registerRoutes(app) {
     return enriched;
   });
 
-  app.get('/orgs/:orgId/documents', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+  app.get('/orgs/:orgId/documents', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { q, limit = 50, offset = 0 } = req.query || {};
