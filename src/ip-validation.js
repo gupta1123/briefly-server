@@ -3,6 +3,8 @@
  * Enforces organization-level IP restrictions for authenticated users
  */
 
+import fp from 'fastify-plugin';
+
 /**
  * Get client IP address from request
  * Handles various proxy scenarios (Heroku, Netlify, etc.)
@@ -96,7 +98,7 @@ async function validateIpAccess(app, orgId, clientIp, userRole = null) {
 /**
  * Fastify plugin for IP validation middleware
  */
-async function ipValidationPlugin(app, options) {
+async function ipValidationPluginImpl(app, options) {
   // Add IP validation method to app instance
   app.decorate('validateIpAccess', validateIpAccess.bind(null, app));
   app.decorate('getClientIp', getClientIp);
@@ -175,8 +177,9 @@ async function ipValidationPlugin(app, options) {
   });
 }
 
-// Add Fastify plugin metadata
-ipValidationPlugin[Symbol.for('skip-override')] = true;
-ipValidationPlugin[Symbol.for('fastify.display-name')] = 'ip-validation';
+// Export with fastify-plugin wrapper
+export const ipValidationPlugin = fp(ipValidationPluginImpl, {
+  name: 'ip-validation'
+});
 
-export { ipValidationPlugin, getClientIp, validateIpAccess };
+export { getClientIp, validateIpAccess };

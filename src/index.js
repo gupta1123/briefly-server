@@ -17,8 +17,8 @@ async function main() {
   await app.register(sse);
   await app.register(jwt, { secret: env.SUPABASE_JWT_SECRET });
   await app.register(multipart);
-  // Register IP validation plugin (temporarily disabled for debugging)
-  // await app.register(ipValidationPlugin);
+  // Register IP validation plugin
+  await app.register(ipValidationPlugin);
 
   // Service-role client for privileged server-side ops (e.g., storage uploads)
   const supabaseAdmin = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {

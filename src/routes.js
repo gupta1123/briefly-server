@@ -504,7 +504,7 @@ export function registerRoutes(app) {
     };
   });
 
-  app.post('/orgs/:orgId/audit/login', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/audit/login', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const clientIp = app.getClientIp(req);
