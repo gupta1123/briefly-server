@@ -7,6 +7,7 @@ import multipart from '@fastify/multipart';
 import { createClient } from '@supabase/supabase-js';
 import { loadEnv } from './env.js';
 import { registerRoutes } from './routes.js';
+import { ipValidationPlugin } from './ip-validation.js';
 
 async function main() {
   const env = loadEnv();
@@ -16,6 +17,7 @@ async function main() {
   await app.register(sse);
   await app.register(jwt, { secret: env.SUPABASE_JWT_SECRET });
   await app.register(multipart);
+  await app.register(ipValidationPlugin);
 
   // Service-role client for privileged server-side ops (e.g., storage uploads)
   const supabaseAdmin = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
