@@ -789,10 +789,138 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const { id } = req.params;
-    const { error } = await db.from('documents').delete().eq('org_id', orgId).eq('id', id);
-    if (error) throw error;
-    await logAudit(app, orgId, userId, 'delete', { doc_id: id, note: 'deleted' });
-    return { ok: true };
+    
+    // First, get the document to retrieve storage information
+    const { data: document, error: fetchError } = await db
+      .from('documents')
+      .select('storage_key, title, filename')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .single();
+      
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') {
+        // Document not found
+        const err = new Error('Document not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      throw fetchError;
+    }
+    
+    // Delete from database first
+    const { error: dbError } = await db.from('documents').delete().eq('org_id', orgId).eq('id', id);
+    if (dbError) throw dbError;
+    
+    // Clean up storage files if they exist
+    const cleanupTasks = [];
+    
+    // 1. Delete main document file from storage
+    if (document.storage_key) {
+      cleanupTasks.push(
+        app.supabaseAdmin.storage
+          .from('documents')
+          .remove([document.storage_key])
+          .catch(error => console.warn(`Failed to delete document file ${document.storage_key}:`, error))
+      );
+    }
+    
+    // 2. Delete extraction data from storage
+    const extractionKey = `${orgId}/${id}`;
+    cleanupTasks.push(
+      app.supabaseAdmin.storage
+        .from('extractions')
+        .remove([extractionKey])
+        .catch(error => console.warn(`Failed to delete extraction data ${extractionKey}:`, error))
+    );
+    
+    // Execute all cleanup tasks in parallel (non-blocking)
+    Promise.all(cleanupTasks).catch(error => 
+      console.error(`Storage cleanup failed for document ${id}:`, error)
+    );
+    
+    // Log the deletion
+    await logAudit(app, orgId, userId, 'delete', { 
+      doc_id: id, 
+      note: `deleted "${document.title || document.filename || 'untitled'}"`,
+      storage_cleaned: !!document.storage_key
+    });
+    
+    return { ok: true, storage_cleaned: !!document.storage_key };
+  });
+
+  // Bulk document deletion endpoint
+  app.delete('/orgs/:orgId/documents', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    const Schema = z.object({ ids: z.array(z.string()).min(1).max(100) }); // Limit to 100 documents
+    const { ids } = Schema.parse(req.body);
+    
+    // Get all documents to retrieve storage information
+    const { data: documents, error: fetchError } = await db
+      .from('documents')
+      .select('id, storage_key, title, filename')
+      .eq('org_id', orgId)
+      .in('id', ids);
+      
+    if (fetchError) throw fetchError;
+    
+    if (documents.length !== ids.length) {
+      const foundIds = documents.map(d => d.id);
+      const missingIds = ids.filter(id => !foundIds.includes(id));
+      const err = new Error(`Some documents not found: ${missingIds.join(', ')}`);
+      err.statusCode = 404;
+      throw err;
+    }
+    
+    // Delete from database in bulk
+    const { error: dbError } = await db.from('documents').delete().eq('org_id', orgId).in('id', ids);
+    if (dbError) throw dbError;
+    
+    // Clean up storage files in parallel (non-blocking)
+    const storageCleanupTasks = [];
+    let storageFilesCount = 0;
+    
+    for (const doc of documents) {
+      // 1. Delete main document file from storage
+      if (doc.storage_key) {
+        storageFilesCount++;
+        storageCleanupTasks.push(
+          app.supabaseAdmin.storage
+            .from('documents')
+            .remove([doc.storage_key])
+            .catch(error => console.warn(`Failed to delete document file ${doc.storage_key}:`, error))
+        );
+      }
+      
+      // 2. Delete extraction data from storage
+      const extractionKey = `${orgId}/${doc.id}`;
+      storageCleanupTasks.push(
+        app.supabaseAdmin.storage
+          .from('extractions')
+          .remove([extractionKey])
+          .catch(error => console.warn(`Failed to delete extraction data ${extractionKey}:`, error))
+      );
+    }
+    
+    // Execute all cleanup tasks in parallel (non-blocking)
+    Promise.all(storageCleanupTasks).catch(error => 
+      console.error(`Bulk storage cleanup failed:`, error)
+    );
+    
+    // Log bulk deletion
+    await logAudit(app, orgId, userId, 'delete', { 
+      note: `bulk deleted ${documents.length} documents`,
+      bulk_count: documents.length,
+      storage_cleaned: storageFilesCount
+    });
+    
+    return { 
+      ok: true, 
+      deleted: documents.length,
+      storage_cleaned: storageFilesCount
+    };
   });
 
   app.post('/orgs/:orgId/documents/move', { preHandler: app.verifyAuth }, async (req) => {
@@ -1297,8 +1425,11 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
-    const Schema = z.object({ path: z.array(z.string()) });
-    const { path } = Schema.parse(req.body);
+    const Schema = z.object({ 
+      path: z.array(z.string()),
+      mode: z.enum(['move_to_root', 'delete_all']).optional().default('move_to_root')
+    });
+    const { path, mode } = Schema.parse(req.body);
     
     if (path.length === 0) {
       const err = new Error('Cannot delete root folder');
@@ -1309,7 +1440,7 @@ export function registerRoutes(app) {
     // Check if folder has any documents (including placeholder)
     const { data: docsInFolder, error: checkError } = await db
       .from('documents')
-      .select('id, title, type')
+      .select('id, title, type, storage_key, filename')
       .eq('org_id', orgId)
       .eq('folder_path', toPgArray(path));
     
@@ -1331,8 +1462,79 @@ export function registerRoutes(app) {
       throw err;
     }
     
-    // Find and delete the placeholder document
+    // Separate placeholder and real documents
     const placeholder = docsInFolder?.find(d => d.type === 'folder' && d.title?.startsWith('[Folder]'));
+    const realDocs = docsInFolder?.filter(d => d.type !== 'folder' || !d.title?.startsWith('[Folder]')) || [];
+    
+    // Handle documents based on mode
+    let documentsHandled = 0;
+    let storageCleanupTasks = [];
+    
+    if (realDocs.length > 0) {
+      if (mode === 'move_to_root') {
+        // Move all real documents to root folder
+        const { error: moveError } = await db
+          .from('documents')
+          .update({ folder_path: [] })
+          .eq('org_id', orgId)
+          .in('id', realDocs.map(d => d.id));
+          
+        if (moveError) throw moveError;
+        
+        documentsHandled = realDocs.length;
+        
+        // Log document moves
+        for (const doc of realDocs) {
+          await logAudit(app, orgId, userId, 'move', { 
+            doc_id: doc.id, 
+            path: [], 
+            note: `moved to root from deleted folder: ${path.join('/')}` 
+          });
+        }
+      } else if (mode === 'delete_all') {
+        // Delete all real documents including their storage
+        const deletionTasks = [];
+        
+        for (const doc of realDocs) {
+          // Delete from database
+          deletionTasks.push(
+            db.from('documents').delete().eq('org_id', orgId).eq('id', doc.id)
+          );
+          
+          // Clean up storage files
+          if (doc.storage_key) {
+            storageCleanupTasks.push(
+              app.supabaseAdmin.storage
+                .from('documents')
+                .remove([doc.storage_key])
+                .catch(error => console.warn(`Failed to delete document file ${doc.storage_key}:`, error))
+            );
+          }
+          
+          // Clean up extraction data
+          const extractionKey = `${orgId}/${doc.id}`;
+          storageCleanupTasks.push(
+            app.supabaseAdmin.storage
+              .from('extractions')
+              .remove([extractionKey])
+              .catch(error => console.warn(`Failed to delete extraction data ${extractionKey}:`, error))
+          );
+        }
+        
+        // Execute database deletions
+        const deletionResults = await Promise.allSettled(deletionTasks);
+        const failedDeletions = deletionResults.filter(result => result.status === 'rejected');
+        
+        if (failedDeletions.length > 0) {
+          console.error('Some document deletions failed:', failedDeletions);
+          throw new Error('Failed to delete some documents in folder');
+        }
+        
+        documentsHandled = realDocs.length;
+      }
+    }
+    
+    // Delete the placeholder document if it exists
     if (placeholder) {
       const { error: deleteError } = await db
         .from('documents')
@@ -1341,18 +1543,30 @@ export function registerRoutes(app) {
         .eq('id', placeholder.id);
       
       if (deleteError) throw deleteError;
-      
-      await logAudit(app, orgId, userId, 'delete', { 
-        doc_id: placeholder.id, 
-        path: path, 
-        note: `deleted folder: ${path.join('/')}` 
-      });
     }
+    
+    // Execute storage cleanup (non-blocking)
+    if (storageCleanupTasks.length > 0) {
+      Promise.all(storageCleanupTasks).catch(error => 
+        console.error(`Storage cleanup failed for folder ${path.join('/')}:`, error)
+      );
+    }
+    
+    // Log the folder deletion
+    await logAudit(app, orgId, userId, 'delete', { 
+      path: path, 
+      note: `deleted folder: ${path.join('/')} (${documentsHandled} docs ${mode === 'move_to_root' ? 'moved to root' : 'deleted'})`,
+      mode: mode,
+      documents_handled: documentsHandled,
+      storage_cleaned: mode === 'delete_all' && realDocs.some(d => d.storage_key)
+    });
     
     return { 
       deleted: true, 
       path: path.join('/'),
-      documentsRemoved: docsInFolder?.length || 0
+      mode: mode,
+      documentsHandled: documentsHandled,
+      storage_cleaned: mode === 'delete_all' && realDocs.some(d => d.storage_key)
     };
   });
 
