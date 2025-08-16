@@ -162,19 +162,25 @@ export function registerRoutes(app) {
   app.get('/me', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const userId = req.user?.sub;
-    const { data: user, error: uerr } = await db.from('app_users').select('*').eq('id', userId).maybeSingle();
-    if (uerr) throw uerr;
-    const { data: orgs, error: oerr } = await db
-      .from('organization_users')
-      .select('org_id, role, expires_at, organizations(name)')
-      .eq('user_id', userId);
-    if (oerr) throw oerr;
+    
+    // Optimize: Use Promise.all to run queries in parallel
+    const [userResult, orgsResult] = await Promise.all([
+      db.from('app_users').select('*').eq('id', userId).maybeSingle(),
+      db.from('organization_users')
+        .select('org_id, role, expires_at, organizations(name)')
+        .eq('user_id', userId)
+    ]);
+    
+    if (userResult.error) throw userResult.error;
+    if (orgsResult.error) throw orgsResult.error;
+    
     // Filter out expired memberships client-side as a safety (RLS already enforced server-side by routes)
     const now = Date.now();
-    const list = (orgs || []).filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now);
+    const list = (orgsResult.data || []).filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now);
+    
     return {
       id: userId,
-      displayName: user?.display_name || null,
+      displayName: userResult.data?.display_name || null,
       orgs: list.map((r) => ({ orgId: r.org_id, role: r.role, name: r.organizations?.name, expiresAt: r.expires_at })),
     };
   });
