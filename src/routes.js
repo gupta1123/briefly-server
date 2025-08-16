@@ -970,7 +970,7 @@ export function registerRoutes(app) {
       return { ok: false, error: 'Documents are already linked' };
     }
     
-    // Insert link with type (trigger will create bidirectional link)
+    // Insert link with type (trigger will create bidirectional link and propagate to versions)
     const { error } = await db.from('document_links').insert({ 
       org_id: orgId, 
       doc_id: id, 
@@ -989,13 +989,129 @@ export function registerRoutes(app) {
     const userId = req.user?.sub;
     const { id, linkedId } = req.params;
     
-    // Delete both directions of the link (though trigger should handle reverse)
-    const { error: error1 } = await db.from('document_links').delete().eq('org_id', orgId).eq('doc_id', id).eq('linked_doc_id', linkedId);
-    const { error: error2 } = await db.from('document_links').delete().eq('org_id', orgId).eq('doc_id', linkedId).eq('linked_doc_id', id);
+    // Delete one direction - trigger will automatically handle the reverse
+    // Also delete all version group propagated links
+    const { error: error1 } = await db.from('document_links').delete()
+      .eq('org_id', orgId)
+      .or(`and(doc_id.eq.${id},linked_doc_id.eq.${linkedId}),and(doc_id.eq.${linkedId},linked_doc_id.eq.${id})`);
+    
+    const error2 = null; // No longer needed since we delete both directions at once
     
     if (error1 || error2) throw error1 || error2;
     await logAudit(app, orgId, userId, 'unlink', { doc_id: id, note: `unlinked ${linkedId}` });
     return { ok: true };
+  });
+
+  // Get all relationships for a document (bidirectional + version aware)
+  app.get('/orgs/:orgId/documents/:id/relationships', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { id } = req.params;
+
+    // Get all documents linked TO this document and FROM this document
+    const { data: allLinks, error: linksError } = await db
+      .from('document_links')
+      .select(`
+        doc_id,
+        linked_doc_id,
+        link_type,
+        created_at
+      `)
+      .eq('org_id', orgId)
+      .or(`doc_id.eq.${id},linked_doc_id.eq.${id}`);
+
+    if (linksError) throw linksError;
+
+    // Get all related document IDs (both directions)
+    const relatedIds = new Set();
+    allLinks?.forEach(link => {
+      if (link.doc_id === id) {
+        relatedIds.add(link.linked_doc_id);
+      } else {
+        relatedIds.add(link.doc_id);
+      }
+    });
+
+    // Fetch details for all related documents
+    let relatedDocs = [];
+    if (relatedIds.size > 0) {
+      const { data: docs, error: docsError } = await db
+        .from('documents')
+        .select('id, title, filename, type, version_group_id, version_number, is_current_version, uploaded_at')
+        .eq('org_id', orgId)
+        .in('id', Array.from(relatedIds));
+
+      if (!docsError && docs) {
+        relatedDocs = docs;
+      }
+    }
+
+    // Group relationships by type
+    const relationships = {
+      linked: [],
+      versions: [],
+      incoming: [], // Documents that link TO this document
+      outgoing: []  // Documents this document links TO
+    };
+
+    allLinks?.forEach(link => {
+      const isOutgoing = link.doc_id === id;
+      const relatedId = isOutgoing ? link.linked_doc_id : link.doc_id;
+      const relatedDoc = relatedDocs.find(d => d.id === relatedId);
+      
+      if (relatedDoc) {
+        const relationship = {
+          id: relatedDoc.id,
+          title: relatedDoc.title || relatedDoc.filename || 'Untitled',
+          type: relatedDoc.type,
+          linkType: link.link_type,
+          linkedAt: link.created_at,
+          isCurrentVersion: relatedDoc.is_current_version,
+          versionNumber: relatedDoc.version_number,
+          direction: isOutgoing ? 'outgoing' : 'incoming'
+        };
+
+        // Categorize the relationship
+        if (isOutgoing) {
+          relationships.outgoing.push(relationship);
+        } else {
+          relationships.incoming.push(relationship);
+        }
+
+        // Also add to general linked array (for backwards compatibility)
+        relationships.linked.push(relationship);
+      }
+    });
+
+    // Get version siblings (documents in the same version group)
+    const { data: targetDoc } = await db
+      .from('documents')
+      .select('version_group_id')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .single();
+
+    if (targetDoc?.version_group_id) {
+      const { data: versionSiblings } = await db
+        .from('documents')
+        .select('id, title, filename, version_number, is_current_version, uploaded_at')
+        .eq('org_id', orgId)
+        .eq('version_group_id', targetDoc.version_group_id)
+        .neq('id', id)
+        .order('version_number', { ascending: true });
+
+      if (versionSiblings) {
+        relationships.versions = versionSiblings.map(doc => ({
+          id: doc.id,
+          title: doc.title || doc.filename || 'Untitled',
+          versionNumber: doc.version_number,
+          isCurrentVersion: doc.is_current_version,
+          uploadedAt: doc.uploaded_at
+        }));
+      }
+    }
+
+    return relationships;
   });
 
   // Smart link suggestions based on content similarity
