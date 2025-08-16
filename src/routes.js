@@ -1819,38 +1819,35 @@ export function registerRoutes(app) {
           tags: z.array(z.string()).min(3),
         }),
       },
-      prompt: `Analyze the following document and return JSON metadata fields. The following are COMPULSORY and must NEVER be empty: Title, Subject, Keywords (>=3), and Tags (>=3). If not explicitly present, synthesize concise, faithful values from the visual/text content.
+      prompt: `You are an expert document summarizer and information extractor.
 
-CATEGORY SELECTION:
-For the category field, you MUST choose from this organization's predefined categories: ${availableCategories.join(', ')}
-- Select the most appropriate category based on the document content and type
-- If uncertain, default to "General"
-- Do NOT create new categories outside this list
+You will receive a document in various formats (PDF, PNG, JPG, DOCX, TXT, MD). Your task is to:
 
-Sender/Receiver Handling:
-- For sender: identify the primary author, issuer, or originating entity.
-- For receiver: identify the primary recipient or target audience.
-- CRITICAL: Scan the document equally for BOTH multiple senders AND multiple receivers. Pay equal attention to both!
+1. Create a concise summary of the document, no more than 300 words, in English.
+2. Identify the subject of the document.
+3. Identify the date the document was sent. If you cannot find one, leave it blank.
+4. Identify all distinct pairs of sender and receiver in the document. For each pair, provide the sender and the receiver.
+5. Extract keywords from the document.
+6. Categorize the document into one of the following categories: ${availableCategories.join(', ')}. Choose the single most appropriate category.
 
-Multiple SENDERS - Use senderOptions when you find:
-  * Multiple "From:" fields, signatures, letterheads, or authors
-  * Joint communications from multiple organizations/departments
-  * Multiple officials or department heads mentioned as sources
-  * Co-signers or multiple authority figures
+Even if the document is in another language, you must provide the summary, subject, date, sender/receiver pairs, keywords, and category in English.
 
-Multiple RECEIVERS - Use receiverOptions when you find:
-  * Multiple names in "To:" field or addressee lines
-  * Document addressed to multiple departments/organizations
-  * CC/BCC lists with multiple meaningful recipients
-  * Distribution lists or broadcast communications
-  * Reports for multiple stakeholders or audiences
-  * Letters mentioning multiple concerned parties or addressees
+Consider the entire document, including any tables, images, and handwritten text. If there are multiple distinct sender/receiver pairs, identify each one.
 
-- Always populate the primary sender/receiver fields with the most likely candidate.
-- senderOptions/receiverOptions should contain 2+ items only when genuinely found in the document.
-- Look just as hard for multiple receivers as you do for multiple senders!
+IMPORTANT OUTPUT REQUIREMENTS:
+- summary: Use the summary from step 1 (max 300 words)
+- subject: Use the subject from step 2
+- documentDate: Use the date from step 3
+- sender: Use the primary sender from step 4
+- receiver: Use the primary receiver from step 4
+- senderOptions: Array of all senders found in step 4
+- receiverOptions: Array of all receivers found in step 4
+- keywords: Use keywords from step 5 (minimum 3)
+- category: Use category from step 6
+- tags: Generate 3-8 relevant tags based on document content
+- title: Generate a concise title based on subject and content
 
-{{media url=dataUri}}`,
+Document: {{media url=dataUri}}`,
     });
 
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
