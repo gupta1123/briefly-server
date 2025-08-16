@@ -620,25 +620,60 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { q, limit = 50, offset = 0 } = req.query || {};
+    console.log('🔍 Building documents query for org:', orgId);
+    console.log('🔍 Query params - q:', q, 'limit:', limit, 'offset:', offset);
+    
     let query = db
       .from('documents')
       .select('*')
       .eq('org_id', orgId)
-      .neq('type', 'folder') // Exclude folder placeholder documents
       .order('uploaded_at', { ascending: false })
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
+    
+    // Apply folder filter after building the base query
+    query = query.filter('type', 'neq', 'folder');
+    
+    console.log('🔍 Query built with .neq("type", "folder")');
+    
+    // Debug: Let's see what's actually in the database
+    const { data: debugData, error: debugError } = await db
+      .from('documents')
+      .select('id, type, title')
+      .eq('org_id', orgId)
+      .limit(10);
+    
+    if (!debugError) {
+      console.log('🔍 DEBUG - Raw database contents (first 10):', debugData);
+      console.log('🔍 DEBUG - Types found:', debugData?.map(d => d.type));
+      console.log('🔍 DEBUG - Any folders?', debugData?.some(d => d.type === 'folder'));
+    }
+    
     if (q && String(q).trim()) {
       const s = `%${String(q).trim()}%`;
       query = query.or(
         `title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},description.ilike.${s}`
       );
     }
+    console.log('🔍 Executing query...');
     const { data, error } = await query;
-    if (error) throw error;
-    console.log('Backend documents fetch - First document folder_path:', data?.[0]?.folder_path, 'Type:', typeof data?.[0]?.folder_path);
+    if (error) {
+      console.error('❌ Query error:', error);
+      throw error;
+    }
+    
+    console.log('🔍 Raw query results - Total documents:', data?.length);
+    if (data && data.length > 0) {
+      console.log('🔍 Document types found:', data.map(d => ({ id: d.id, type: d.type, title: d.title })));
+      console.log('🔍 Any folders in results?', data.some(d => d.type === 'folder'));
+    }
+    
+    // Double-check: manually filter out any folders that might have slipped through
+    const filteredData = data?.filter(d => d.type !== 'folder') || [];
+    console.log('🔍 After manual filtering - Total documents:', filteredData.length);
+    console.log('🔍 Manual filter removed:', (data?.length || 0) - filteredData.length, 'folder documents');
     
     // Fetch linked documents for all documents
-    const docIds = (data || []).map(d => d.id);
+    const docIds = (filteredData || []).map(d => d.id);
     let linksMap = {};
     if (docIds.length > 0) {
       const { data: links, error: linksError } = await db
@@ -658,7 +693,7 @@ export function registerRoutes(app) {
     }
     
     // Map database fields to frontend expected field names and add linked document IDs
-    const mappedData = (data || []).map(d => ({
+    const mappedData = (filteredData || []).map(d => ({
       ...d,
       // Map database snake_case to frontend camelCase
       uploadedAt: d.uploaded_at,
@@ -680,6 +715,8 @@ export function registerRoutes(app) {
       name: d.title || d.filename || 'Untitled'
     }));
     
+    console.log('🔍 Final result - Returning', mappedData.length, 'documents');
+    console.log('🔍 Final document types:', mappedData.map(d => d.type));
     return mappedData;
   });
 
