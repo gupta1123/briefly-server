@@ -261,6 +261,7 @@ export function registerRoutes(app) {
       chat_filters_enabled: false,
       ip_allowlist_enabled: false,
       ip_allowlist_ips: [],
+      categories: ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'],
     };
   });
 
@@ -288,6 +289,7 @@ export function registerRoutes(app) {
       chat_filters_enabled: z.boolean().optional(),
       ip_allowlist_enabled: z.boolean().optional(),
       ip_allowlist_ips: z.array(z.string()).optional(),
+      categories: z.array(z.string()).optional(),
     });
     const body = Schema.parse(req.body || {});
     const payload = { org_id: orgId, ...body };
