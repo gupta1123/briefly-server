@@ -1446,13 +1446,21 @@ export function registerRoutes(app) {
     
     if (checkError) throw checkError;
     
-    // Check if folder has subfolders
-    const { data: subfolders, error: subError } = await db
+    // Check if folder has subfolders by looking for folders that start with our path
+    // We'll fetch all folders and check in JavaScript since PostgreSQL array operators are tricky
+    const { data: allFolders, error: subError } = await db
       .from('documents')
       .select('folder_path')
       .eq('org_id', orgId)
-      .neq('folder_path', toPgArray(path))
-      .like('folder_path', `{${path.join(',')},%`);
+      .not('folder_path', 'eq', toPgArray(path));
+    
+    // Filter for subfolders in JavaScript
+    const subfolders = allFolders?.filter(doc => {
+      const folderPath = doc.folder_path;
+      if (!folderPath || folderPath.length <= path.length) return false;
+      // Check if this folder starts with our path
+      return path.every((segment, index) => folderPath[index] === segment);
+    }) || [];
     
     if (subError) throw subError;
     
