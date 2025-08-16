@@ -1083,7 +1083,7 @@ export function registerRoutes(app) {
       }
     });
 
-    // Get version siblings (documents in the same version group)
+    // Get version relationships (both siblings and children)
     const { data: targetDoc } = await db
       .from('documents')
       .select('version_group_id')
@@ -1091,6 +1091,9 @@ export function registerRoutes(app) {
       .eq('id', id)
       .single();
 
+    let versionDocs = [];
+
+    // Case 1: This document is part of a version group (has a parent)
     if (targetDoc?.version_group_id) {
       const { data: versionSiblings } = await db
         .from('documents')
@@ -1101,15 +1104,34 @@ export function registerRoutes(app) {
         .order('version_number', { ascending: true });
 
       if (versionSiblings) {
-        relationships.versions = versionSiblings.map(doc => ({
-          id: doc.id,
-          title: doc.title || doc.filename || 'Untitled',
-          versionNumber: doc.version_number,
-          isCurrentVersion: doc.is_current_version,
-          uploadedAt: doc.uploaded_at
-        }));
+        versionDocs = versionSiblings;
       }
     }
+
+    // Case 2: This document IS a version group parent (other docs point to it)
+    const { data: versionChildren } = await db
+      .from('documents')
+      .select('id, title, filename, version_number, is_current_version, uploaded_at')
+      .eq('org_id', orgId)
+      .eq('version_group_id', id)
+      .order('version_number', { ascending: true });
+
+    if (versionChildren) {
+      versionDocs = [...versionDocs, ...versionChildren];
+    }
+
+    // Remove duplicates and map to final format
+    const uniqueVersions = versionDocs.filter((doc, index, array) => 
+      array.findIndex(d => d.id === doc.id) === index
+    );
+
+    relationships.versions = uniqueVersions.map(doc => ({
+      id: doc.id,
+      title: doc.title || doc.filename || 'Untitled',
+      versionNumber: doc.version_number,
+      isCurrentVersion: doc.is_current_version,
+      uploadedAt: doc.uploaded_at
+    }));
 
     return relationships;
   });
