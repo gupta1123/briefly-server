@@ -812,11 +812,39 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const { id } = req.params;
-    const Schema = z.object({ linkedId: z.string() });
+    const Schema = z.object({ 
+      linkedId: z.string(),
+      linkType: z.string().optional().default('related') 
+    });
     const body = Schema.parse(req.body);
-    const { error } = await db.from('document_links').insert({ org_id: orgId, doc_id: id, linked_doc_id: body.linkedId });
+    
+    // Prevent self-linking
+    if (id === body.linkedId) {
+      return { ok: false, error: 'Cannot link document to itself' };
+    }
+    
+    // Check if link already exists (bidirectional check)
+    const { data: existingLink } = await db
+      .from('document_links')
+      .select('*')
+      .eq('org_id', orgId)
+      .or(`and(doc_id.eq.${id},linked_doc_id.eq.${body.linkedId}),and(doc_id.eq.${body.linkedId},linked_doc_id.eq.${id})`)
+      .limit(1);
+    
+    if (existingLink && existingLink.length > 0) {
+      return { ok: false, error: 'Documents are already linked' };
+    }
+    
+    // Insert link with type (trigger will create bidirectional link)
+    const { error } = await db.from('document_links').insert({ 
+      org_id: orgId, 
+      doc_id: id, 
+      linked_doc_id: body.linkedId,
+      link_type: body.linkType
+    });
     if (error) throw error;
-    await logAudit(app, orgId, userId, 'link', { doc_id: id, note: `linked ${body.linkedId}` });
+    
+    await logAudit(app, orgId, userId, 'link', { doc_id: id, note: `linked ${body.linkedId} (${body.linkType})` });
     return { ok: true };
   });
 
@@ -825,10 +853,132 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const { id, linkedId } = req.params;
-    const { error } = await db.from('document_links').delete().eq('org_id', orgId).eq('doc_id', id).eq('linked_doc_id', linkedId);
-    if (error) throw error;
+    
+    // Delete both directions of the link (though trigger should handle reverse)
+    const { error: error1 } = await db.from('document_links').delete().eq('org_id', orgId).eq('doc_id', id).eq('linked_doc_id', linkedId);
+    const { error: error2 } = await db.from('document_links').delete().eq('org_id', orgId).eq('doc_id', linkedId).eq('linked_doc_id', id);
+    
+    if (error1 || error2) throw error1 || error2;
     await logAudit(app, orgId, userId, 'unlink', { doc_id: id, note: `unlinked ${linkedId}` });
     return { ok: true };
+  });
+
+  // Smart link suggestions based on content similarity
+  app.get('/orgs/:orgId/documents/:id/suggest-links', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { id } = req.params;
+    
+    // Get the target document
+    const { data: targetDoc, error: targetError } = await db
+      .from('documents')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .single();
+    
+    if (targetError || !targetDoc) return { suggestions: [] };
+    
+    // Get all other documents in the organization
+    const { data: allDocs, error: docsError } = await db
+      .from('documents')
+      .select('id, title, filename, sender, receiver, category, tags, keywords, document_date, type')
+      .eq('org_id', orgId)
+      .neq('id', id);
+    
+    if (docsError || !allDocs) return { suggestions: [] };
+    
+    // Get existing links to exclude them
+    const { data: existingLinks } = await db
+      .from('document_links')
+      .select('linked_doc_id')
+      .eq('org_id', orgId)
+      .eq('doc_id', id);
+    
+    const linkedIds = new Set((existingLinks || []).map(l => l.linked_doc_id));
+    
+    // Calculate similarity scores
+    const suggestions = allDocs
+      .filter(doc => !linkedIds.has(doc.id))
+      .map(doc => {
+        let score = 0;
+        let reasons = [];
+        
+        // Same sender/receiver (high relevance)
+        if (targetDoc.sender && doc.sender === targetDoc.sender) {
+          score += 30;
+          reasons.push(`Same sender: ${doc.sender}`);
+        }
+        if (targetDoc.receiver && doc.receiver === targetDoc.receiver) {
+          score += 30;
+          reasons.push(`Same receiver: ${doc.receiver}`);
+        }
+        
+        // Same category
+        if (targetDoc.category && doc.category === targetDoc.category) {
+          score += 20;
+          reasons.push(`Same category: ${doc.category}`);
+        }
+        
+        // Similar document type
+        if (targetDoc.type && doc.type === targetDoc.type) {
+          score += 15;
+          reasons.push(`Same type: ${doc.type}`);
+        }
+        
+        // Tag overlap
+        const targetTags = targetDoc.tags || [];
+        const docTags = doc.tags || [];
+        const commonTags = targetTags.filter(tag => docTags.includes(tag));
+        if (commonTags.length > 0) {
+          score += commonTags.length * 10;
+          reasons.push(`Common tags: ${commonTags.join(', ')}`);
+        }
+        
+        // Keyword overlap
+        const targetKeywords = targetDoc.keywords || [];
+        const docKeywords = doc.keywords || [];
+        const commonKeywords = targetKeywords.filter(kw => docKeywords.includes(kw));
+        if (commonKeywords.length > 0) {
+          score += commonKeywords.length * 5;
+          reasons.push(`Common keywords: ${commonKeywords.slice(0, 3).join(', ')}`);
+        }
+        
+        // Date proximity (within 30 days)
+        if (targetDoc.document_date && doc.document_date) {
+          const targetDate = new Date(targetDoc.document_date);
+          const docDate = new Date(doc.document_date);
+          const daysDiff = Math.abs((targetDate.getTime() - docDate.getTime()) / (1000 * 3600 * 24));
+          if (daysDiff <= 30) {
+            score += Math.max(10 - daysDiff / 3, 0);
+            reasons.push(`Similar date (${Math.round(daysDiff)} days apart)`);
+          }
+        }
+        
+        // Title/filename similarity (basic text matching)
+        const targetTitle = (targetDoc.title || targetDoc.filename || '').toLowerCase();
+        const docTitle = (doc.title || doc.filename || '').toLowerCase();
+        const titleWords = targetTitle.split(/\s+/).filter(w => w.length > 3);
+        const docWords = docTitle.split(/\s+/).filter(w => w.length > 3);
+        const commonWords = titleWords.filter(w => docWords.some(dw => dw.includes(w) || w.includes(dw)));
+        if (commonWords.length > 0) {
+          score += commonWords.length * 8;
+          reasons.push(`Similar title words: ${commonWords.slice(0, 2).join(', ')}`);
+        }
+        
+        return {
+          id: doc.id,
+          title: doc.title || doc.filename || 'Untitled',
+          score: Math.round(score),
+          reasons: reasons.slice(0, 3), // Top 3 reasons
+          suggestedLinkType: score > 50 ? 'related' : 'reference'
+        };
+      })
+      .filter(s => s.score > 10) // Minimum threshold
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10); // Top 10 suggestions
+    
+    return { suggestions };
   });
 
   app.post('/orgs/:orgId/documents/:id/version', { preHandler: app.verifyAuth }, async (req) => {
