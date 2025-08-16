@@ -618,6 +618,7 @@ export function registerRoutes(app) {
       .from('documents')
       .select('*')
       .eq('org_id', orgId)
+      .neq('type', 'folder') // Exclude folder placeholder documents
       .order('uploaded_at', { ascending: false })
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
     if (q && String(q).trim()) {
@@ -1300,9 +1301,11 @@ export function registerRoutes(app) {
     if (checkError) throw checkError;
     
     if (existing && existing.length > 0) {
-      const err = new Error('Folder already exists');
-      err.statusCode = 409;
-      throw err;
+      return reply.code(409).send({ 
+        error: 'Folder already exists',
+        message: `A folder named "${cleanName}" already exists in this location.`,
+        code: 'FOLDER_EXISTS' 
+      });
     }
     
     // Create a placeholder document to establish the folder
@@ -1561,13 +1564,13 @@ export function registerRoutes(app) {
     }
     
     // Log the folder deletion
-    await logAudit(app, orgId, userId, 'delete', { 
-      path: path, 
+      await logAudit(app, orgId, userId, 'delete', { 
+        path: path, 
       note: `deleted folder: ${path.join('/')} (${documentsHandled} docs ${mode === 'move_to_root' ? 'moved to root' : 'deleted'})`,
       mode: mode,
       documents_handled: documentsHandled,
       storage_cleaned: mode === 'delete_all' && realDocs.some(d => d.storage_key)
-    });
+      });
     
     return { 
       deleted: true, 
