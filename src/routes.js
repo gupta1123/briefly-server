@@ -1228,6 +1228,14 @@ export function registerRoutes(app) {
     const Schema = z.object({ storageKey: z.string(), mimeType: z.string().optional() });
     const { storageKey, mimeType } = Schema.parse(req.body);
 
+    // Get organization categories for AI context
+    const { data: orgSettings } = await req.supabase
+      .from('org_settings')
+      .select('categories')
+      .eq('org_id', orgId)
+      .maybeSingle();
+    const availableCategories = orgSettings?.categories || ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'];
+
     const { data: fileBlob, error: dlErr } = await app.supabaseAdmin.storage.from('documents').download(storageKey);
     if (dlErr || !fileBlob) return reply.code(400).send({ error: 'Unable to download storage object' });
 
@@ -1256,6 +1264,12 @@ export function registerRoutes(app) {
         }),
       },
       prompt: `Analyze the following document and return JSON metadata fields. The following are COMPULSORY and must NEVER be empty: Title, Subject, Keywords (>=3), and Tags (>=3). If not explicitly present, synthesize concise, faithful values from the visual/text content.
+
+CATEGORY SELECTION:
+For the category field, you MUST choose from this organization's predefined categories: ${availableCategories.join(', ')}
+- Select the most appropriate category based on the document content and type
+- If uncertain, default to "General"
+- Do NOT create new categories outside this list
 
 Sender/Receiver Handling:
 - For sender: identify the primary author, issuer, or originating entity.
