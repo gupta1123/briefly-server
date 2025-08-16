@@ -1777,4 +1777,46 @@ Multiple RECEIVERS - Use receiverOptions when you find:
       app.log.error(e, 'failed to persist assistant message');
     }
   });
+
+  // File serving endpoint for secure document preview
+  app.get('/orgs/:orgId/documents/:id/file', { preHandler: app.verifyAuth }, async (req, reply) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { id } = req.params;
+    
+    // Get document details
+    const { data: doc, error: docError } = await db
+      .from('documents')
+      .select('storage_key, mime_type, filename, title')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .single();
+    
+    if (docError || !doc || !doc.storage_key) {
+      return reply.code(404).send({ error: 'Document or file not found' });
+    }
+    
+    try {
+      // Get signed URL from Supabase Storage
+      const { data: signedUrl, error: urlError } = await app.supabaseAdmin.storage
+        .from('documents')
+        .createSignedUrl(doc.storage_key, 3600); // 1 hour expiry
+      
+      if (urlError || !signedUrl) {
+        app.log.error(urlError, 'Failed to create signed URL');
+        return reply.code(500).send({ error: 'Failed to access file' });
+      }
+      
+      // Return file metadata and signed URL
+      return {
+        url: signedUrl.signedUrl,
+        mimeType: doc.mime_type,
+        filename: doc.filename || doc.title || 'document',
+        expires: new Date(Date.now() + 3600 * 1000).toISOString()
+      };
+    } catch (error) {
+      app.log.error(error, 'File serving error');
+      return reply.code(500).send({ error: 'Failed to serve file' });
+    }
+  });
 }
