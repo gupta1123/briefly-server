@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "seed:org": "node scripts/seed-org.js"
   },
   "dependencies": {
     "@fastify/cors": "^8.4.0",

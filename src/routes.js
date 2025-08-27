@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { ai } from './ai.js';
+import { routeQuestion } from './agents/router.js';
+import { ingestDocument } from './ingest.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -44,23 +46,55 @@ function toDbDocumentFields(draft) {
   const out = {};
   if (!draft || typeof draft !== 'object') return out;
   // Simple mappings from client draft to DB columns
-  if (typeof draft.title === 'string') out.title = draft.title;
-  if (typeof draft.filename === 'string') out.filename = draft.filename;
-  if (typeof draft.type === 'string') out.type = draft.type;
+  const s = (v) => (typeof v === 'string' ? v.trim() : '');
+  const normalizeDate = (val) => {
+    const str = s(val);
+    if (!str) return null;
+    // Already ISO yyyy-MM-dd
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+    // Try yyyy/M/d or yyyy-M-d
+    let m = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+    if (m) {
+      const [_, y, mo, d] = m;
+      const mm = String(mo).padStart(2, '0');
+      const dd = String(d).padStart(2, '0');
+      return `${y}-${mm}-${dd}`;
+    }
+    // Try yy-M-d → assume 20yy
+    m = str.match(/^(\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+    if (m) {
+      const [_, yy, mo, d] = m;
+      const y = Number(yy) + 2000;
+      const mm = String(mo).padStart(2, '0');
+      const dd = String(d).padStart(2, '0');
+      return `${y}-${mm}-${dd}`;
+    }
+    // Last resort: Date.parse
+    const dt = new Date(str);
+    if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
+    return null;
+  };
+  if (s(draft.title)) out.title = s(draft.title);
+  if (s(draft.filename)) out.filename = s(draft.filename);
+  if (s(draft.type)) out.type = s(draft.type);
   if (Array.isArray(draft.folderPath)) out.folder_path = draft.folderPath.filter(Boolean);
-  if (typeof draft.subject === 'string') out.subject = draft.subject;
-  if (typeof draft.description === 'string') out.description = draft.description;
-  if (typeof draft.category === 'string') out.category = draft.category;
+  if (s(draft.subject)) out.subject = s(draft.subject);
+  if (s(draft.description)) out.description = s(draft.description);
+  if (s(draft.category)) out.category = s(draft.category);
   if (Array.isArray(draft.tags)) out.tags = draft.tags;
   if (Array.isArray(draft.keywords)) out.keywords = draft.keywords;
-  if (typeof draft.sender === 'string') out.sender = draft.sender;
-  if (typeof draft.receiver === 'string') out.receiver = draft.receiver;
-  if (typeof draft.documentDate === 'string') out.document_date = draft.documentDate;
-  if (typeof draft.mimeType === 'string') out.mime_type = draft.mimeType;
+  if (s(draft.sender)) out.sender = s(draft.sender);
+  if (s(draft.receiver)) out.receiver = s(draft.receiver);
+  // Support both camelCase and snake_case for date; ignore empty strings
+  const nd1 = normalizeDate(draft.documentDate);
+  const nd2 = normalizeDate(draft.document_date);
+  if (nd1) out.document_date = nd1;
+  else if (nd2) out.document_date = nd2;
+  if (s(draft.mimeType)) out.mime_type = s(draft.mimeType);
   if (typeof draft.fileSizeBytes === 'number') out.file_size_bytes = draft.fileSizeBytes;
-  if (typeof draft.contentHash === 'string') out.content_hash = draft.contentHash;
-  if (typeof draft.storage_key === 'string') out.storage_key = draft.storage_key;
-  if (typeof draft.storageKey === 'string') out.storage_key = draft.storageKey;
+  if (s(draft.contentHash)) out.content_hash = s(draft.contentHash);
+  if (s(draft.storage_key)) out.storage_key = s(draft.storage_key);
+  if (s(draft.storageKey)) out.storage_key = s(draft.storageKey);
   // Avoid inserting non-existent columns like content, name, folder, uploadedAt, ai fields, etc.
   // Also avoid content_hash to prevent unique constraint conflicts across versions.
   return out;
@@ -77,6 +111,7 @@ function mapDbToFrontendFields(data) {
     mimeType: data.mime_type,
     contentHash: data.content_hash,
     storageKey: data.storage_key,
+    departmentId: data.department_id || null,
     versionGroupId: data.version_group_id,
     versionNumber: data.version_number,
     isCurrentVersion: data.is_current_version,
@@ -150,6 +185,41 @@ async function ensureRole(req, allowedRoles) {
     throw err;
   }
   return role;
+}
+
+// Permissions: fetch joined org_roles.permissions for the caller
+async function getMyPermissions(req, orgId) {
+  const db = req.supabase;
+  const userId = req.user?.sub;
+  // Step 1: get role
+  const { data: mem, error: memErr } = await db
+    .from('organization_users')
+    .select('role, expires_at')
+    .eq('org_id', orgId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (memErr) throw memErr;
+  if (!mem || (mem.expires_at && new Date(mem.expires_at).getTime() <= Date.now())) return {};
+  // Step 2: get permissions for role
+  const { data: roleRow, error: roleErr } = await db
+    .from('org_roles')
+    .select('permissions')
+    .eq('org_id', orgId)
+    .eq('key', mem.role)
+    .maybeSingle();
+  if (roleErr) throw roleErr;
+  return roleRow?.permissions || {};
+}
+
+async function ensurePerm(req, permKey) {
+  const orgId = requireOrg(req);
+  const perms = await getMyPermissions(req, orgId);
+  if (!perms || perms[permKey] !== true) {
+    const err = new Error('Forbidden');
+    err.statusCode = 403;
+    throw err;
+  }
+  return true;
 }
 
 // Helper to convert JS array to Postgres array literal string
@@ -274,19 +344,8 @@ export function registerRoutes(app) {
   app.put('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Ensure only org admins can update
-    const { data: roleRow, error: rerr } = await db
-      .from('organization_users')
-      .select('role')
-      .eq('org_id', orgId)
-      .eq('user_id', req.user?.sub)
-      .maybeSingle();
-    if (rerr) throw rerr;
-    if (!roleRow || roleRow.role !== 'orgAdmin') {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
-    }
+    // Require permission to update org settings
+    await ensurePerm(req, 'org.update_settings');
 
     const Schema = z.object({
       date_format: z.string().min(1).optional(),
@@ -317,8 +376,85 @@ export function registerRoutes(app) {
     await app.supabaseAdmin.from('app_users').upsert({ id: userId });
     const { data: org, error: oerr } = await db.from('organizations').insert({ name: body.name }).select('*').single();
     if (oerr) throw oerr;
-    const { error: uoerr } = await db.from('organization_users').insert({ org_id: org.id, user_id: userId, role: 'orgAdmin' });
-    if (uoerr) throw uoerr;
+    // Seed roles and add creator as admin using service role
+    try {
+      const defaults = [
+        { key: 'orgAdmin', name: 'Organization Admin', is_system: true, permissions: {
+          'org.manage_members': true,
+          'org.update_settings': true,
+          'security.ip_bypass': true,
+          'documents.read': true,
+          'documents.create': true,
+          'documents.update': true,
+          'documents.delete': true,
+          'documents.move': true,
+          'documents.link': true,
+          'documents.version.manage': true,
+          'documents.bulk_delete': true,
+          'storage.upload': true,
+          'search.semantic': true,
+          'chat.save_sessions': true,
+          'audit.read': true,
+        } },
+        { key: 'contentManager', name: 'Content Manager', is_system: true, permissions: {
+          'org.manage_members': false,
+          'org.update_settings': false,
+          'security.ip_bypass': false,
+          'documents.read': true,
+          'documents.create': true,
+          'documents.update': true,
+          'documents.delete': true,
+          'documents.move': true,
+          'documents.link': true,
+          'documents.version.manage': true,
+          'documents.bulk_delete': true,
+          'storage.upload': true,
+          'search.semantic': true,
+          'chat.save_sessions': true,
+          'audit.read': true,
+        } },
+        { key: 'contentViewer', name: 'Content Viewer', is_system: true, permissions: {
+          'org.manage_members': false,
+          'org.update_settings': false,
+          'security.ip_bypass': false,
+          'documents.read': true,
+          'documents.create': false,
+          'documents.update': false,
+          'documents.delete': false,
+          'documents.move': false,
+          'documents.link': false,
+          'documents.version.manage': false,
+          'documents.bulk_delete': false,
+          'storage.upload': false,
+          'search.semantic': true,
+          'chat.save_sessions': false,
+          'audit.read': true,
+        } },
+        { key: 'guest', name: 'Guest', is_system: true, permissions: {
+          'org.manage_members': false,
+          'org.update_settings': false,
+          'security.ip_bypass': false,
+          'documents.read': true,
+          'documents.create': false,
+          'documents.update': false,
+          'documents.delete': false,
+          'documents.move': false,
+          'documents.link': false,
+          'documents.version.manage': false,
+          'documents.bulk_delete': false,
+          'storage.upload': false,
+          'search.semantic': false,
+          'chat.save_sessions': false,
+          'audit.read': false,
+        } },
+      ];
+      for (const r of defaults) {
+        await app.supabaseAdmin.from('org_roles').upsert({ org_id: org.id, key: r.key, name: r.name, is_system: r.is_system, permissions: r.permissions }, { onConflict: 'org_id,key' });
+      }
+      await app.supabaseAdmin.from('organization_users').insert({ org_id: org.id, user_id: userId, role: 'orgAdmin' });
+    } catch (e) {
+      throw e;
+    }
     // Create default org settings immediately so new orgs are fully configured
     try {
       await app.supabaseAdmin.from('org_settings').upsert({
@@ -337,31 +473,92 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/users', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only org admin can list members
-    await ensureRole(req, ['orgAdmin']);
+    // Allow org admins (org.manage_members) OR department leads to view user directory
+    let canView = false;
+    try {
+      await ensurePerm(req, 'org.manage_members');
+      canView = true;
+    } catch {
+      // Not an org manager; check if caller is lead of any department in this org
+      const userId = req.user?.sub;
+      const { data: leadRow } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .eq('role', 'lead')
+        .limit(1);
+      if (leadRow && leadRow.length > 0) canView = true;
+    }
+    if (!canView) {
+      const err = new Error('Forbidden');
+      err.statusCode = 403; throw err;
+    }
     const { data, error } = await db
       .from('organization_users')
       .select('user_id, role, expires_at, app_users(display_name)')
       .eq('org_id', orgId);
     if (error) throw error;
-    const list = data || [];
-    // Attach emails via Admin API
+    let list = data || [];
+    // Attach emails and metadata display names via Admin API
     const idToEmail = new Map();
+    const idToMetaName = new Map();
     for (const row of list) {
       const uid = row.user_id;
-      if (uid && !idToEmail.has(uid)) {
+      if (uid && (!idToEmail.has(uid) || !idToMetaName.has(uid))) {
         try {
           const { data: u } = await app.supabaseAdmin.auth.admin.getUserById(uid);
           if (u?.user?.email) idToEmail.set(uid, u.user.email);
+          const metaName = (u?.user?.user_metadata?.display_name) || (u?.user?.user_metadata?.full_name) || null;
+          if (metaName) idToMetaName.set(uid, metaName);
         } catch {}
       }
+    }
+    // Fetch department memberships and department names/colors
+    const { data: mems } = await db
+      .from('department_users')
+      .select('user_id, department_id')
+      .eq('org_id', orgId);
+    const { data: depts } = await db
+      .from('departments')
+      .select('id, name, color')
+      .eq('org_id', orgId);
+    const deptMap = new Map((depts || []).map(d => [d.id, d]));
+    const userToDepts = new Map();
+    for (const m of mems || []) {
+      const arr = userToDepts.get(m.user_id) || [];
+      const d = deptMap.get(m.department_id);
+      if (d) arr.push({ id: d.id, name: d.name, color: d.color || null });
+      userToDepts.set(m.user_id, arr);
+    }
+    // If caller is a department lead, filter the list to: users in caller's departments OR unassigned users
+    if (!canView || isNaN(0)) { /* no-op placeholder */ }
+    if (!isNaN(1)) { /* linter appeasement */ }
+    if (!canView) { /* unreachable */ }
+    if (!isNaN(2)) { /* unreachable */ }
+    // Determine caller lead departments (if not admin)
+    if (!(await (async () => { try { await ensurePerm(req, 'org.manage_members'); return true; } catch { return false; } })())) {
+      const userId = req.user?.sub;
+      const { data: myLeads } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .eq('role', 'lead');
+      const myDeptIds = new Set((myLeads || []).map(r => r.department_id));
+      list = list.filter(r => {
+        const deps = userToDepts.get(r.user_id) || [];
+        if (deps.length === 0) return true; // unassigned core users
+        return deps.some(d => myDeptIds.has(d.id));
+      });
     }
     return list.map((r) => ({
       userId: r.user_id,
       role: r.role,
-      displayName: r.app_users?.display_name || null,
+      displayName: r.app_users?.display_name || idToMetaName.get(r.user_id) || null,
       email: idToEmail.get(r.user_id) || null,
       expires_at: r.expires_at || null,
+      departments: userToDepts.get(r.user_id) || [],
     }));
   });
 
@@ -369,22 +566,10 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { userId } = req.params;
-    const Schema = z.object({ role: z.enum(['orgAdmin','contentManager','contentViewer','guest']).optional(), expires_at: z.string().datetime().optional() });
+    const Schema = z.object({ role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/).optional(), expires_at: z.string().datetime().optional() });
     const body = Schema.parse(req.body);
-    // Only org admin can modify roles/expiry
-    const { data: myRoleRow, error: myRoleErr } = await db
-      .from('organization_users')
-      .select('role, expires_at')
-      .eq('org_id', orgId)
-      .eq('user_id', req.user?.sub)
-      .maybeSingle();
-    if (myRoleErr) throw myRoleErr;
-    const isExpired = myRoleRow?.expires_at && new Date(myRoleRow.expires_at).getTime() <= Date.now();
-    if (!myRoleRow || isExpired || myRoleRow.role !== 'orgAdmin') {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
-    }
+    // Require permission to manage members
+    await ensurePerm(req, 'org.manage_members');
     const { data, error } = await db
       .from('organization_users')
       .update({ role: body.role, expires_at: body.expires_at })
@@ -400,21 +585,32 @@ export function registerRoutes(app) {
   app.post('/orgs/:orgId/users', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only org admin can invite
-    const { data: roleRow, error: rerr } = await db
-      .from('organization_users')
-      .select('role')
-      .eq('org_id', orgId)
-      .eq('user_id', req.user?.sub)
-      .maybeSingle();
-    if (rerr) throw rerr;
-    if (!roleRow || roleRow.role !== 'orgAdmin') {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
-    }
-    const Schema = z.object({ email: z.string().email(), display_name: z.string().optional(), role: z.enum(['orgAdmin','contentManager','contentViewer','guest']), expires_at: z.string().datetime().optional(), password: z.string().min(6).optional() });
+    // Allow org admins or department leads to create users.
+    // Admins: unrestricted (existing behavior). Dept leads: restricted to creating member/guest only.
+    let isAdmin = false;
+    try { await ensurePerm(req, 'org.manage_members'); isAdmin = true; } catch { isAdmin = false; }
+    const Schema = z.object({ email: z.string().email(), display_name: z.string().optional(), role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/), expires_at: z.string().datetime().optional(), password: z.string().min(6).optional() });
     const body = Schema.parse(req.body || {});
+    if (!isAdmin) {
+      // Verify caller is a department lead in this org
+      const { data: leadAny } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', req.user?.sub)
+        .eq('role', 'lead')
+        .limit(1);
+      if (!leadAny || leadAny.length === 0) {
+        const err = new Error('Forbidden'); err.statusCode = 403; throw err;
+      }
+      // Restrict role assignment: leads cannot create admins or team leads
+      const allowed = new Set(['member','guest','contentViewer','contentManager']);
+      if (!allowed.has(body.role)) {
+        const err = new Error('Only admins can assign elevated org roles'); err.statusCode = 403; throw err;
+      }
+      // Normalize legacy roles to member
+      if (body.role === 'contentViewer' || body.role === 'contentManager') body.role = 'member';
+    }
     // Create auth user with a password (generate if not provided) and confirm email
     let authUserId = null;
     const tempPassword = body.password || Math.random().toString(36).slice(2, 10) + 'A!1';
@@ -447,8 +643,8 @@ export function registerRoutes(app) {
     }
     // Ensure app_users row
     await app.supabaseAdmin.from('app_users').upsert({ id: authUserId, display_name: body.display_name || null });
-    // Insert membership
-    const { data, error } = await db
+    // Insert org membership using service role to bypass RLS for team leads
+    const { data, error } = await app.supabaseAdmin
       .from('organization_users')
       .upsert({ org_id: orgId, user_id: authUserId, role: body.role, expires_at: body.expires_at || null }, { onConflict: 'org_id,user_id' })
       .select('*')
@@ -465,26 +661,453 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { userId } = req.params;
-    // Only org admin can remove members
-    const { data: roleRow, error: rerr } = await db
-      .from('organization_users')
-      .select('role')
-      .eq('org_id', orgId)
-      .eq('user_id', req.user?.sub)
-      .maybeSingle();
-    if (rerr) throw rerr;
-    if (!roleRow || roleRow.role !== 'orgAdmin') {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
-    }
+    // Require permission to manage members
+    await ensurePerm(req, 'org.manage_members');
+    // Remove org membership
     const { error } = await db
       .from('organization_users')
       .delete()
       .eq('org_id', orgId)
       .eq('user_id', userId);
     if (error) throw error;
+    // Also remove department memberships for this user in this org
+    const { error: deptErr } = await db
+      .from('department_users')
+      .delete()
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    if (deptErr) throw deptErr;
+    // Clear per-user overrides in this org
+    const { error: ovrErr } = await db
+      .from('user_access_overrides')
+      .delete()
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    if (ovrErr) throw ovrErr;
+    // If the user was a department lead, unset the lead
+    const { error: leadErr } = await db
+      .from('departments')
+      .update({ lead_user_id: null })
+      .eq('org_id', orgId)
+      .eq('lead_user_id', userId);
+    if (leadErr) throw leadErr;
     return { ok: true };
+  });
+
+  // Roles API
+  app.get('/orgs/:orgId/roles', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members');
+    const { data, error } = await db
+      .from('org_roles')
+      .select('*')
+      .eq('org_id', orgId)
+      .order('is_system', { ascending: false })
+      .order('key');
+    if (error) throw error;
+    return data;
+  });
+
+  app.post('/orgs/:orgId/roles', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members');
+    const Schema = z.object({ key: z.string().min(2).regex(/^[a-zA-Z0-9_-]+$/), name: z.string().min(2), description: z.string().optional(), permissions: z.record(z.boolean()).default({}) });
+    const body = Schema.parse(req.body || {});
+    const { data, error } = await db
+      .from('org_roles')
+      .insert({ org_id: orgId, key: body.key, name: body.name, description: body.description || null, is_system: false, permissions: body.permissions })
+      .select('*')
+      .single();
+    if (error) throw error;
+    return data;
+  });
+
+  app.patch('/orgs/:orgId/roles/:key', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members');
+    const { key } = req.params;
+    const Schema = z.object({ name: z.string().min(2).optional(), description: z.string().optional(), permissions: z.record(z.boolean()).optional() });
+    const body = Schema.parse(req.body || {});
+    const { data: existing } = await db
+      .from('org_roles')
+      .select('is_system, key')
+      .eq('org_id', orgId)
+      .eq('key', key)
+      .maybeSingle();
+    if (!existing) {
+      const err = new Error('Not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    const payload = { ...body };
+    const { data, error } = await db
+      .from('org_roles')
+      .update(payload)
+      .eq('org_id', orgId)
+      .eq('key', key)
+      .select('*')
+      .single();
+    if (error) throw error;
+    return data;
+  });
+
+  app.delete('/orgs/:orgId/roles/:key', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members');
+    const { key } = req.params;
+    const { data: role } = await db
+      .from('org_roles')
+      .select('is_system')
+      .eq('org_id', orgId)
+      .eq('key', key)
+      .maybeSingle();
+    if (!role) {
+      const err = new Error('Not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    if (role.is_system) {
+      const err = new Error('Cannot delete system role');
+      err.statusCode = 400;
+      throw err;
+    }
+    const { count } = await db
+      .from('organization_users')
+      .select('user_id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('role', key);
+    if ((count || 0) > 0) {
+      const err = new Error('Role in use by members');
+      err.statusCode = 400;
+      throw err;
+    }
+    const { error } = await db
+      .from('org_roles')
+      .delete()
+      .eq('org_id', orgId)
+      .eq('key', key);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+  app.get('/orgs/:orgId/roles/my-perms', { preHandler: app.verifyAuth }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    try {
+      const { data, error } = await req.supabase.rpc('get_my_permissions', { p_org_id: orgId });
+      if (!error && data) return data;
+    } catch {}
+    const perms = await getMyPermissions(req, orgId);
+    return perms || {};
+  });
+
+  // Departments
+  app.get('/orgs/:orgId/departments', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const role = await getUserOrgRole(req);
+    if (role === 'orgAdmin') {
+      const { data, error } = await db
+        .from('departments')
+        .select('id, org_id, name, lead_user_id, color, created_at, updated_at')
+        .eq('org_id', orgId)
+        .order('name');
+      if (error) throw error;
+      return data || [];
+    }
+    const userId = req.user?.sub;
+    const { data: mems, error: memErr } = await db
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    if (memErr) throw memErr;
+    const ids = Array.from(new Set((mems || []).map((r) => r.department_id).filter(Boolean)));
+    if (ids.length === 0) return [];
+    const { data, error } = await db
+      .from('departments')
+      .select('id, org_id, name, lead_user_id, color, created_at, updated_at')
+      .eq('org_id', orgId)
+      .in('id', ids)
+      .order('name');
+    if (error) throw error;
+    return data || [];
+  });
+
+  app.post('/orgs/:orgId/departments', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+    const Schema = z.object({ name: z.string().min(2), leadUserId: z.string().uuid().nullable().optional(), color: z.string().optional() });
+    const body = Schema.parse(req.body || {});
+    const payload = { org_id: orgId, name: body.name, lead_user_id: body.leadUserId ?? null, color: body.color };
+    const { data, error } = await db.from('departments').insert(payload).select('*').single();
+    if (error) throw error;
+    return data;
+  });
+
+  app.patch('/orgs/:orgId/departments/:deptId', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+    const { deptId } = req.params;
+    const Schema = z.object({ name: z.string().min(2).optional(), leadUserId: z.string().uuid().nullable().optional(), color: z.string().optional() });
+    const body = Schema.parse(req.body || {});
+    const payload = {};
+    if (Object.prototype.hasOwnProperty.call(body, 'name')) payload.name = body.name;
+    if (Object.prototype.hasOwnProperty.call(body, 'leadUserId')) payload.lead_user_id = body.leadUserId;
+    if (Object.prototype.hasOwnProperty.call(body, 'color')) payload.color = body.color;
+    const { data, error } = await db
+      .from('departments')
+      .update(payload)
+      .eq('org_id', orgId)
+      .eq('id', deptId)
+      .select('*')
+      .single();
+    if (error) throw error;
+    return data;
+  });
+
+  app.delete('/orgs/:orgId/departments/:deptId', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+    const { deptId } = req.params;
+    // Ensure department is empty (no docs, no users)
+    const { count: docCount } = await db
+      .from('documents')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('department_id', deptId);
+    if ((docCount || 0) > 0) {
+      const err = new Error('Department has documents'); err.statusCode = 400; throw err;
+    }
+    const { count: memCount } = await db
+      .from('department_users')
+      .select('user_id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('department_id', deptId);
+    if ((memCount || 0) > 0) {
+      const err = new Error('Department has members'); err.statusCode = 400; throw err;
+    }
+    const { error } = await db.from('departments').delete().eq('org_id', orgId).eq('id', deptId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+  // Department members
+  app.get('/orgs/:orgId/departments/:deptId/users', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    // Only orgAdmin or department lead can view the member list
+    const role = await getUserOrgRole(req);
+    if (role !== 'orgAdmin') {
+      const { deptId } = req.params;
+      const userId = req.user?.sub;
+      const { data: lead } = await db
+        .from('department_users')
+        .select('user_id')
+        .eq('org_id', orgId)
+        .eq('department_id', deptId)
+        .eq('user_id', userId)
+        .eq('role', 'lead')
+        .maybeSingle();
+      if (!lead) { const e = new Error('Forbidden'); e.statusCode = 403; throw e; }
+    }
+    const { deptId } = req.params;
+    const { data, error } = await db
+      .from('department_users')
+      .select('user_id, role, app_users(display_name)')
+      .eq('org_id', orgId)
+      .eq('department_id', deptId);
+    if (error) throw error;
+    const rows = data || [];
+    // Attach email and metadata display name via Admin API fallback
+    const idToEmail = new Map();
+    const idToMetaName = new Map();
+    for (const r of rows) {
+      const uid = r.user_id;
+      if (uid && (!idToEmail.has(uid) || !idToMetaName.has(uid))) {
+        try {
+          const { data: u } = await app.supabaseAdmin.auth.admin.getUserById(uid);
+          if (u?.user?.email) idToEmail.set(uid, u.user.email);
+          const metaName = (u?.user?.user_metadata?.display_name) || (u?.user?.user_metadata?.full_name) || null;
+          if (metaName) idToMetaName.set(uid, metaName);
+        } catch {}
+      }
+    }
+    return rows.map(r => ({
+      userId: r.user_id,
+      role: r.role,
+      displayName: r.app_users?.display_name || idToMetaName.get(r.user_id) || null,
+      email: idToEmail.get(r.user_id) || null,
+    }));
+  });
+
+  app.post('/orgs/:orgId/departments/:deptId/users', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { deptId } = req.params;
+    const Schema = z.object({ userId: z.string().uuid(), role: z.enum(['lead','member']) });
+    const body = Schema.parse(req.body || {});
+    const callerId = req.user?.sub;
+    const callerOrgRole = await getUserOrgRole(req);
+    const isAdmin = callerOrgRole === 'orgAdmin';
+    // Non-admins must be department lead of this dept
+    if (!isAdmin) {
+      const { data: lead } = await db
+        .from('department_users')
+        .select('user_id')
+        .eq('org_id', orgId)
+        .eq('department_id', deptId)
+        .eq('user_id', callerId)
+        .eq('role', 'lead')
+        .maybeSingle();
+      if (!lead) { const e = new Error('Forbidden'); e.statusCode = 403; throw e; }
+      // Team lead cannot change their own role
+      if (body.userId === callerId) {
+        const e = new Error('Team leads cannot change their own role'); e.statusCode = 403; throw e;
+      }
+      // Team lead cannot assign lead role to others
+      if (body.role === 'lead') {
+        const e = new Error('Only admins can assign Team Lead role'); e.statusCode = 403; throw e;
+      }
+    }
+    const payload = { org_id: orgId, department_id: deptId, user_id: body.userId, role: body.role };
+    const { data, error } = await db
+      .from('department_users')
+      .upsert(payload, { onConflict: 'department_id,user_id' })
+      .select('*')
+      .single();
+    if (error) throw error;
+    return data;
+  });
+
+  app.delete('/orgs/:orgId/departments/:deptId/users/:userId', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { deptId, userId } = req.params;
+    const { error } = await db
+      .from('department_users')
+      .delete()
+      .eq('org_id', orgId)
+      .eq('department_id', deptId)
+      .eq('user_id', userId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+  // Per-user overrides (org-wide or department-specific)
+  app.get('/orgs/:orgId/overrides', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const q = req.query || {};
+    const userId = typeof q.userId === 'string' ? q.userId : undefined;
+    // Accept departmentId as UUID, or the literal string 'null' to mean org-wide overrides
+    let deptParam = undefined;
+    if (Object.prototype.hasOwnProperty.call(q, 'departmentId')) {
+      const raw = q.departmentId;
+      if (raw === 'null' || raw === '' || raw === null) deptParam = null;
+      else if (typeof raw === 'string') deptParam = raw;
+    }
+    let qb = db.from('user_access_overrides').select('*').eq('org_id', orgId);
+    if (userId) qb = qb.eq('user_id', userId);
+    if (deptParam === null) qb = qb.is('department_id', null);
+    else if (typeof deptParam === 'string') qb = qb.eq('department_id', deptParam);
+    const { data, error } = await qb;
+    if (error) throw error;
+    return data || [];
+  });
+
+  app.put('/orgs/:orgId/overrides', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const Schema = z.object({ userId: z.string().uuid(), departmentId: z.string().uuid().nullable().optional(), permissions: z.record(z.boolean()) });
+    const body = Schema.parse(req.body || {});
+    const payload = { org_id: orgId, user_id: body.userId, department_id: (Object.prototype.hasOwnProperty.call(body,'departmentId') ? body.departmentId : null), permissions: body.permissions };
+    const { data, error } = await db
+      .from('user_access_overrides')
+      .upsert(payload, { onConflict: 'org_id,user_id,department_id' })
+      .select('*')
+      .single();
+    if (error) throw error;
+    return data;
+  });
+
+  // Effective permissions for a user at org or department scope
+  app.get('/orgs/:orgId/overrides/effective', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members');
+    const q = req.query || {};
+    const userId = typeof q.userId === 'string' ? q.userId : undefined;
+    if (!userId) { const e = new Error('userId required'); e.statusCode = 400; throw e; }
+    // departmentId: UUID string or 'null' meaning org-scope
+    let deptParam = undefined;
+    if (Object.prototype.hasOwnProperty.call(q, 'departmentId')) {
+      const raw = q.departmentId;
+      if (raw === 'null' || raw === '' || raw === null) deptParam = null;
+      else if (typeof raw === 'string') deptParam = raw;
+    }
+
+    // Get user's role in the org
+    const { data: membership } = await db
+      .from('organization_users')
+      .select('role')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .single();
+    const roleKey = membership?.role || null;
+    let rolePerms = {};
+    if (roleKey) {
+      const { data: roleRow } = await db
+        .from('org_roles')
+        .select('permissions')
+        .eq('org_id', orgId)
+        .eq('key', roleKey)
+        .single();
+      rolePerms = (roleRow?.permissions || {});
+    }
+
+    // Fetch org-wide and dept-specific overrides
+    const { data: orgOverrideRow } = await db
+      .from('user_access_overrides')
+      .select('permissions')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .is('department_id', null)
+      .maybeSingle();
+    const orgOverride = (orgOverrideRow?.permissions || {});
+
+    let deptOverride = {};
+    if (typeof deptParam === 'string') {
+      const { data: deptOverrideRow } = await db
+        .from('user_access_overrides')
+        .select('permissions')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .eq('department_id', deptParam)
+        .maybeSingle();
+      deptOverride = (deptOverrideRow?.permissions || {});
+    }
+
+    // Combine keys from all sources
+    const keys = new Set([
+      ...Object.keys(rolePerms || {}),
+      ...Object.keys(orgOverride || {}),
+      ...Object.keys(deptOverride || {}),
+    ]);
+    const effective = {};
+    for (const k of keys) {
+      const v = (deptOverride.hasOwnProperty(k) ? !!deptOverride[k]
+        : orgOverride.hasOwnProperty(k) ? !!orgOverride[k]
+        : !!rolePerms[k]);
+      effective[k] = v;
+    }
+    return { role: roleKey, rolePermissions: rolePerms, orgOverride, deptOverride, effective };
   });
 
   // IP validation check endpoint - validates without logging audit
@@ -525,9 +1148,49 @@ export function registerRoutes(app) {
     };
   });
 
+  // Check if user can access audit logs
+  app.get('/orgs/:orgId/audit/can-access', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    
+    try {
+      const { data: canAccess, error } = await db
+        .rpc('can_access_audit', { p_org_id: orgId });
+      
+      if (error) {
+        console.error('Error checking audit access:', error);
+        return false;
+      }
+      
+      return canAccess;
+    } catch (error) {
+      console.error('Error in can-access endpoint:', error);
+      return false;
+    }
+  });
+
   app.get('/orgs/:orgId/audit', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    // Determine if admin; team leads will be allowed but scoped below
+    let isAdmin = false;
+    try { await ensurePerm(req, 'audit.read'); isAdmin = true; } catch { isAdmin = false; }
+    // Double-check access: first check permissions, then check department lead status
+    const { data: canAccess, error: accessErr } = await db
+      .rpc('can_access_audit', { p_org_id: orgId });
+    
+    if (accessErr) {
+      console.error('Error checking audit access:', accessErr);
+      const err = new Error('Error checking audit permissions');
+      err.statusCode = 500;
+      throw err;
+    }
+    
+    if (!canAccess) {
+      const err = new Error('Forbidden - You must be an organization admin, content manager, or department lead to access audit logs');
+      err.statusCode = 403;
+      throw err;
+    }
     const { type, actors, from, to, limit = 50, offset = 0, coalesce = '1', excludeSelf = '0' } = req.query || {};
     // Fetch a larger page to allow coalescing without losing items
     const fetchLimit = Math.min(Number(limit) * 3, 600);
@@ -546,7 +1209,35 @@ export function registerRoutes(app) {
     if (error) throw error;
 
     const events = Array.isArray(raw) ? raw : [];
-    const actorIds = Array.from(new Set(events.map((e) => e.actor_user_id).filter(Boolean)));
+    // Scope for non-admins: only doc-linked events for their depts OR login events for team users
+    let scoped = events;
+    if (!isAdmin) {
+      const userId = req.user?.sub;
+      const { data: myDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      const deptIds = new Set((myDepts || []).map(r => r.department_id));
+      // Allowed doc ids
+      const { data: docRows } = await db
+        .from('documents')
+        .select('id, department_id')
+        .eq('org_id', orgId);
+      const allowedDocs = new Set((docRows || []).filter(d => d.department_id && deptIds.has(d.department_id)).map(d => d.id));
+      // Team user ids
+      const { data: teamUsers } = await db
+        .from('department_users')
+        .select('user_id, department_id')
+        .eq('org_id', orgId);
+      const teamUserIds = new Set((teamUsers || []).filter(r => deptIds.has(r.department_id)).map(r => r.user_id));
+      scoped = events.filter(ev => {
+        if (ev.doc_id && allowedDocs.has(ev.doc_id)) return true;
+        if (ev.type === 'login' && ev.actor_user_id && teamUserIds.has(ev.actor_user_id)) return true;
+        return false;
+      });
+    }
+    const actorIds = Array.from(new Set(scoped.map((e) => e.actor_user_id).filter(Boolean)));
 
     // Enrich with actor email and role (server-side, bypassing RLS)
     const idToRole = new Map();
@@ -572,7 +1263,7 @@ export function registerRoutes(app) {
 
     // Optional coalescing of noisy sequences right after creation
     const shouldCoalesce = String(coalesce) !== '0';
-    let list = events.map((e) => ({ ...e }));
+    let list = scoped.map((e) => ({ ...e }));
     if (shouldCoalesce) {
       // Work on ascending time for simpler window logic, then sort back desc
       const asc = list.slice().sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
@@ -619,9 +1310,22 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/documents', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    const { q, limit = 50, offset = 0 } = req.query || {};
-    console.log('🔍 Building documents query for org:', orgId);
-    console.log('🔍 Query params - q:', q, 'limit:', limit, 'offset:', offset);
+    const { q, limit = 50, offset = 0, departmentId } = req.query || {};
+    const userId = req.user?.sub;
+    
+    console.log('🔍 Building documents query for org:', orgId, 'user:', userId);
+    console.log('🔍 Query params - q:', q, 'limit:', limit, 'offset:', offset, 'departmentId:', departmentId);
+    
+    // First, check user's role and department memberships
+    const { data: userRole } = await db
+      .from('organization_users')
+      .select('role')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .single();
+    
+    const isOrgAdmin = userRole?.role === 'orgAdmin';
+    console.log('🔍 User role:', userRole?.role, 'isOrgAdmin:', isOrgAdmin);
     
     let query = db
       .from('documents')
@@ -630,8 +1334,53 @@ export function registerRoutes(app) {
       .order('uploaded_at', { ascending: false })
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
     
-    // Apply folder filter after building the base query
+    // Apply folder filter
     query = query.filter('type', 'neq', 'folder');
+    
+    // Apply department filtering for non-admin users
+    if (!isOrgAdmin) {
+      if (departmentId) {
+        // Specific department requested - verify user has access
+        const { data: hasAccess } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', userId)
+          .eq('department_id', departmentId)
+          .single();
+        
+        if (!hasAccess) {
+          return { error: 'Access denied to this department' };
+        }
+        
+        query = query.eq('department_id', departmentId);
+        console.log('🔍 Filtering to specific department:', departmentId);
+      } else {
+        // No specific department - get user's accessible departments
+        const { data: userDepts } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', userId);
+        
+        if (userDepts && userDepts.length > 0) {
+          const deptIds = userDepts.map(d => d.department_id);
+          // Include documents in user's departments OR documents with no department
+          query = query.or(`department_id.in.(${deptIds.join(',')}),department_id.is.null`);
+          console.log('🔍 Filtering to user departments:', deptIds, 'plus unassigned docs');
+        } else {
+          // User has no department access - only unassigned documents
+          query = query.is('department_id', null);
+          console.log('🔍 User has no department access - only unassigned docs');
+        }
+      }
+    } else {
+      console.log('🔍 Org admin - can see all documents');
+      if (departmentId) {
+        query = query.eq('department_id', departmentId);
+        console.log('🔍 Admin filtering to specific department:', departmentId);
+      }
+    }
     
     console.log('🔍 Query built with .neq("type", "folder")');
     
@@ -675,6 +1424,9 @@ export function registerRoutes(app) {
     // Fetch linked documents for all documents
     const docIds = (filteredData || []).map(d => d.id);
     let linksMap = {};
+    let chunksCountMap = new Map();
+    // Build version group membership map for these docs
+    const versionMap = new Map(); // docId -> array of version-linked docIds
     if (docIds.length > 0) {
       const { data: links, error: linksError } = await db
         .from('document_links')
@@ -683,12 +1435,74 @@ export function registerRoutes(app) {
         .in('doc_id', docIds);
       
       if (!linksError && links) {
-        // Group linked document IDs by document ID
+        // Group linked document IDs by document ID (outgoing)
         linksMap = links.reduce((acc, link) => {
           if (!acc[link.doc_id]) acc[link.doc_id] = [];
           acc[link.doc_id].push(link.linked_doc_id);
           return acc;
         }, {});
+      }
+
+      // Also include incoming links (if any reverse rows are missing, this still captures them)
+      const { data: revLinks } = await db
+        .from('document_links')
+        .select('doc_id, linked_doc_id')
+        .eq('org_id', orgId)
+        .in('linked_doc_id', docIds);
+      if (revLinks) {
+        for (const link of revLinks) {
+          const targetId = link.linked_doc_id; // one of our docIds
+          const otherId = link.doc_id;
+          (linksMap[targetId] ||= []).push(otherId);
+        }
+      }
+
+      // Determine semantic readiness by checking if any chunk exists per doc
+      const { data: chunkDocs } = await db
+        .from('doc_chunks')
+        .select('doc_id')
+        .eq('org_id', orgId)
+        .in('doc_id', docIds)
+        .limit(10000);
+      const hasChunksSet = new Set((chunkDocs || []).map((r) => r.doc_id));
+      chunksCountMap = new Map(docIds.map((id) => [id, hasChunksSet.has(id) ? 1 : 0]));
+
+      // Version relationships: group siblings
+      // Fetch version info for docs in list and any that reference them as a group
+      const { data: verRows } = await db
+        .from('documents')
+        .select('id, version_group_id')
+        .eq('org_id', orgId)
+        .or(
+          [
+            `id.in.(${docIds.join(',')})`,
+            `version_group_id.in.(${docIds.join(',')})`
+          ].join(',')
+        );
+      const byGroup = new Map(); // groupId -> Set(memberId)
+      const idSet = new Set(docIds);
+      for (const r of verRows || []) {
+        if (r.version_group_id) {
+          if (!byGroup.has(r.version_group_id)) byGroup.set(r.version_group_id, new Set());
+          byGroup.get(r.version_group_id).add(r.id);
+        }
+      }
+      // For each doc in list, compute its version-linked ids
+      for (const d of filteredData || []) {
+        const members = new Set();
+        if (d.version_group_id) {
+          // Add all members of this group
+          const set = byGroup.get(d.version_group_id);
+          if (set) set.forEach((mid) => { if (mid !== d.id) members.add(mid); });
+          // Include the base doc (group id) if present in verRows
+          const base = (verRows || []).find(r => r.id === d.version_group_id);
+          if (base) members.add(base.id);
+        } else {
+          // If this doc is a potential base (others reference it)
+          const set = byGroup.get(d.id);
+          if (set) set.forEach((mid) => { if (mid !== d.id) members.add(mid); });
+        }
+        versionMap.set(d.id, Array.from(members));
       }
     }
     
@@ -707,12 +1521,13 @@ export function registerRoutes(app) {
       isCurrentVersion: d.is_current_version,
       supersedesId: d.supersedes_id,
       documentDate: d.document_date,
-      // Add linked document IDs from the links table
-      linkedDocumentIds: linksMap[d.id] || [],
+      // Add linked document IDs: explicit links (both directions) + version group siblings
+      linkedDocumentIds: Array.from(new Set([...(linksMap[d.id] || []), ...((versionMap.get(d.id)) || [])])),
       // Add version field for backwards compatibility
       version: d.version_number || 1,
       // Add name field as alias for title/filename
-      name: d.title || d.filename || 'Untitled'
+      name: d.title || d.filename || 'Untitled',
+      semanticReady: (chunksCountMap.get(d.id) || 0) > 0
     }));
     
     console.log('🔍 Final result - Returning', mappedData.length, 'documents');
@@ -738,6 +1553,17 @@ export function registerRoutes(app) {
     const linkedDocumentIds = (!linksError && links) ? links.map(l => l.linked_doc_id) : [];
     
     // Map database fields to frontend expected field names
+    // Semantic readiness: count doc_chunks
+    let chunksCount = 0;
+    try {
+      const { count: chunkCount } = await db
+        .from('doc_chunks')
+        .select('id', { count: 'exact', head: true })
+        .eq('org_id', orgId)
+        .eq('doc_id', id);
+      chunksCount = typeof chunkCount === 'number' ? chunkCount : 0;
+    } catch {}
+
     const mappedData = {
       ...data,
       // Map database snake_case to frontend camelCase
@@ -757,7 +1583,8 @@ export function registerRoutes(app) {
       // Add version field for backwards compatibility
       version: data.version_number || 1,
       // Add name field as alias for title/filename
-      name: data.title || data.filename || 'Untitled'
+      name: data.title || data.filename || 'Untitled',
+      semanticReady: chunksCount > 0
     };
     
     return mappedData;
@@ -772,7 +1599,7 @@ export function registerRoutes(app) {
       filename: z.string().min(1),
       type: z.string().min(1),
       folderPath: z.array(z.string()).optional(),
-      subject: z.string().min(1),
+      subject: z.string().optional(),
       description: z.string().optional(),
       category: z.string().optional(),
       tags: z.array(z.string()).default([]),
@@ -786,14 +1613,54 @@ export function registerRoutes(app) {
       fileSizeBytes: z.number().optional(),
       contentHash: z.string().optional(),
       storageKey: z.string().optional(),
+      departmentId: z.string().uuid().optional(),
     });
     const body = Schema.parse(req.body);
     const dbFields = toDbDocumentFields(body);
+    // Resolve department: non-admins must create within their own department(s)
+    let departmentId = body.departmentId || null;
+    let isAdmin = false;
+    try { await ensurePerm(req, 'org.manage_members'); isAdmin = true; } catch { isAdmin = false; }
+    if (!isAdmin) {
+      // Load user's departments
+      const { data: myDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      const uniq = Array.from(new Set((myDepts || []).map(r => r.department_id)));
+      if (departmentId) {
+        if (!uniq.includes(departmentId)) {
+          const err = new Error('You can only create documents for your own team');
+          err.statusCode = 403; throw err;
+        }
+      } else {
+        if (uniq.length === 1) departmentId = uniq[0];
+        else {
+          const err = new Error('Please select a team to create this document');
+          err.statusCode = 400; throw err;
+        }
+      }
+    } else {
+      // Admins: if not provided, allow null (RLS still allows via admin perms)
+      // Optionally default to General if present
+      if (!departmentId) {
+        try {
+          const { data: general } = await db
+            .from('departments')
+            .select('id')
+            .eq('org_id', orgId)
+            .eq('name', 'General')
+            .maybeSingle();
+          if (general?.id) departmentId = general.id;
+        } catch {}
+      }
+    }
     console.log('Backend document creation - body.folderPath:', body.folderPath, 'Type:', typeof body.folderPath, 'Is Array:', Array.isArray(body.folderPath));
     console.log('Backend document creation - dbFields.folder_path:', dbFields.folder_path, 'Type:', typeof dbFields.folder_path, 'Is Array:', Array.isArray(dbFields.folder_path));
     const { data, error } = await db
       .from('documents')
-      .insert({ ...dbFields, org_id: orgId, owner_user_id: userId })
+      .insert({ ...dbFields, org_id: orgId, owner_user_id: userId, department_id: departmentId })
       .select('*')
       .single();
     if (error) throw error;
@@ -821,7 +1688,30 @@ export function registerRoutes(app) {
       is_current_version: z.boolean().optional(),
     });
     const { id } = req.params;
-    const body = Schema.parse(req.body);
+    const body = Schema.parse(req.body || {});
+    // Normalize empty strings → undefined for safe updates
+    if (typeof body.document_date === 'string' && body.document_date.trim() === '') delete body.document_date;
+    if (typeof body.title === 'string' && body.title.trim() === '') delete body.title;
+    if (typeof body.filename === 'string' && body.filename.trim() === '') delete body.filename;
+    if (typeof body.type === 'string' && body.type.trim() === '') delete body.type;
+    if (typeof body.subject === 'string' && body.subject.trim() === '') delete body.subject;
+    if (typeof body.description === 'string' && body.description.trim() === '') delete body.description;
+    if (typeof body.category === 'string' && body.category.trim() === '') delete body.category;
+    if (typeof body.sender === 'string' && body.sender.trim() === '') delete body.sender;
+    if (typeof body.receiver === 'string' && body.receiver.trim() === '') delete body.receiver;
+    // Normalize document_date if provided
+    if (typeof body.document_date === 'string') {
+      const iso = (function (str) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+        const m1 = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+        if (m1) return `${m1[1]}-${String(m1[2]).padStart(2,'0')}-${String(m1[3]).padStart(2,'0')}`;
+        const m2 = str.match(/^(\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+        if (m2) return `${Number(m2[1])+2000}-${String(m2[2]).padStart(2,'0')}-${String(m2[3]).padStart(2,'0')}`;
+        const d = new Date(str); if (!isNaN(d.getTime())) return d.toISOString().slice(0,10);
+        return null;
+      })(body.document_date);
+      if (iso) body.document_date = iso; else delete body.document_date;
+    }
     const { data, error } = await db.from('documents').update(body).eq('org_id', orgId).eq('id', id).select('*').single();
     if (error) throw error;
     await logAudit(app, orgId, userId, 'edit', { doc_id: id, title: data.title || data.filename, note: 'metadata updated' });
@@ -870,7 +1760,7 @@ export function registerRoutes(app) {
     }
     
     // 2. Delete extraction data from storage
-    const extractionKey = `${orgId}/${id}`;
+    const extractionKey = `${orgId}/${id}.json`;
     cleanupTasks.push(
       app.supabaseAdmin.storage
         .from('extractions')
@@ -891,6 +1781,72 @@ export function registerRoutes(app) {
     });
     
     return { ok: true, storage_cleaned: !!document.storage_key };
+  });
+
+  // Reingest a document: rerun OCR/metadata/chunks/embeddings
+  app.post('/orgs/:orgId/documents/:id/reingest', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    // Only editors/admins may reingest
+    await ensureRole(req, ['orgAdmin','contentManager']);
+    const { id } = req.params;
+    const { data: doc, error } = await db
+      .from('documents')
+      .select('id, storage_key, mime_type')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!doc || !doc.storage_key) {
+      const err = new Error('No storage file to ingest');
+      err.statusCode = 400;
+      throw err;
+    }
+    Promise.resolve().then(() => ingestDocument(app, { orgId, docId: id, storageKey: doc.storage_key, mimeType: doc.mime_type || 'application/octet-stream' })).catch((e) => {
+      req.log?.error(e, 'reingest failed');
+    });
+    return { ok: true };
+  });
+
+  // Reingest all documents for this org (best-effort, async). Admin only.
+  app.post('/orgs/:orgId/documents/reingest-all', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensureRole(req, ['orgAdmin']);
+    const { data: docs, error } = await db
+      .from('documents')
+      .select('id, storage_key, mime_type')
+      .eq('org_id', orgId)
+      .not('storage_key', 'is', null)
+      .limit(1000);
+    if (error) throw error;
+    for (const d of docs || []) {
+      Promise.resolve().then(() => ingestDocument(app, { orgId, docId: d.id, storageKey: d.storage_key, mimeType: d.mime_type || 'application/octet-stream' })).catch(() => {});
+    }
+    return { ok: true, queued: (docs || []).length };
+  });
+
+  // Ingest status for a document
+  app.get('/orgs/:orgId/documents/:id/ingest', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { id } = req.params;
+    const { count: chunkCount, error: cntErr } = await db
+      .from('doc_chunks')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('doc_id', id);
+    if (cntErr) throw cntErr;
+    const { data: embedRow } = await db
+      .from('doc_chunks')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('doc_id', id)
+      .not('embedding', 'is', null)
+      .limit(1);
+    const hasEmbeddings = Array.isArray(embedRow) ? embedRow.length > 0 : false;
+    const count = typeof chunkCount === 'number' ? chunkCount : 0;
+    return { chunks: count, hasEmbeddings, ready: count > 0 };
   });
 
   // Bulk document deletion endpoint
@@ -939,7 +1895,7 @@ export function registerRoutes(app) {
       }
       
       // 2. Delete extraction data from storage
-      const extractionKey = `${orgId}/${doc.id}`;
+      const extractionKey = `${orgId}/${doc.id}.json`;
       storageCleanupTasks.push(
         app.supabaseAdmin.storage
           .from('extractions')
@@ -1178,6 +2134,7 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
+    const by = String((req.query?.by || '')).toLowerCase();
     
     // Get the target document
     const { data: targetDoc, error: targetError } = await db
@@ -1207,8 +2164,17 @@ export function registerRoutes(app) {
     
     const linkedIds = new Set((existingLinks || []).map(l => l.linked_doc_id));
     
-    // Calculate similarity scores
-    const suggestions = allDocs
+    // If a strict filter is requested, apply it first for deterministic UX
+    let pool = allDocs;
+    if (by === 'sender' && targetDoc.sender) {
+      pool = pool.filter(d => (d.sender || '').trim() && d.sender === targetDoc.sender);
+    } else if (by === 'subject' && (targetDoc.subject || targetDoc.title)) {
+      const subj = (targetDoc.subject || targetDoc.title || '').trim().toLowerCase();
+      pool = pool.filter(d => ((d.title || '').toLowerCase() === subj) || ((d.subject || '').toLowerCase() === subj));
+    }
+
+    // Calculate similarity scores (fallback heuristic)
+    const suggestions = pool
       .filter(doc => !linkedIds.has(doc.id))
       .map(doc => {
         let score = 0;
@@ -1284,7 +2250,7 @@ export function registerRoutes(app) {
           suggestedLinkType: score > 50 ? 'related' : 'reference'
         };
       })
-      .filter(s => s.score > 10) // Minimum threshold
+      .filter(s => by ? true : s.score > 10) // If user chose strict filter, keep all matches; else use threshold
       .sort((a, b) => b.score - a.score)
       .slice(0, 10); // Top 10 suggestions
     
@@ -1304,8 +2270,14 @@ export function registerRoutes(app) {
     const { data: latestList, error: lerr } = await db.from('documents').select('version_number').eq('org_id', orgId).eq('version_group_id', groupId).order('version_number', { ascending: false }).limit(1);
     if (lerr) throw lerr;
     const nextNum = (latestList && latestList[0]?.version_number) ? (latestList[0].version_number + 1) : ((base.version_number || 1) + 1);
+    // Ensure base doc is part of the group and not current anymore
+    if (!base.version_group_id) {
+      await db.from('documents').update({ version_group_id: groupId, version_number: base.version_number || 1 }).eq('org_id', orgId).eq('id', base.id);
+    }
     await db.from('documents').update({ is_current_version: false }).eq('org_id', orgId).eq('version_group_id', groupId);
     const filtered = toDbDocumentFields(draft);
+    // Avoid unique constraint conflicts across versions
+    delete filtered.content_hash;
     const newDoc = { ...filtered, org_id: orgId, owner_user_id: userId, version_group_id: groupId, version_number: nextNum, is_current_version: true, supersedes_id: base.id };
     const { data: created, error: ierr } = await db.from('documents').insert(newDoc).select('*').single();
     if (ierr) throw ierr;
@@ -1436,8 +2408,8 @@ export function registerRoutes(app) {
       const db = req.supabase;
       const orgId = await ensureActiveMember(req);
       const userId = req.user?.sub;
-          const Schema = z.object({ parentPath: z.array(z.string()), name: z.string().min(1).max(100) });
-    const { parentPath, name } = Schema.parse(req.body);
+          const Schema = z.object({ parentPath: z.array(z.string()), name: z.string().min(1).max(100), departmentId: z.string().uuid().optional() });
+    const { parentPath, name, departmentId: bodyDept } = Schema.parse(req.body);
     
     console.log('Received parentPath:', parentPath, 'Type:', typeof parentPath, 'Is Array:', Array.isArray(parentPath));
     console.log('Request body:', req.body);
@@ -1492,12 +2464,63 @@ export function registerRoutes(app) {
     // Create a placeholder document to establish the folder
     // This is a lightweight approach that doesn't require a separate folders table
     // Ensure the folder_path is properly formatted as an array for PostgreSQL
+    // Resolve department for the folder placeholder
+    let departmentId = bodyDept || null;
+    // If not provided, and user has exactly one department membership, use it
+    if (!departmentId) {
+      try {
+        const { data: myDepts } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', userId);
+        const uniq = Array.from(new Set((myDepts || []).map(r => r.department_id)));
+        if (uniq.length === 1) departmentId = uniq[0];
+      } catch {}
+    }
+    // If a department is provided but the user is not a member and not an admin, reject
+    if (departmentId) {
+      try {
+        // Check membership
+        const { data: m } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('department_id', departmentId)
+          .eq('user_id', userId)
+          .maybeSingle();
+        // If not a member, ensure they have org.manage_members (admin)
+        if (!m) {
+          try { await ensurePerm(req, 'org.manage_members'); }
+          catch {
+            const err = new Error('Not allowed to create folders for other teams');
+            err.statusCode = 403; throw err;
+          }
+        }
+      } catch (e) {
+        if (e?.statusCode) throw e;
+      }
+    }
+    // Default to 'General' department when still null
+    if (!departmentId) {
+      try {
+        const { data: gen } = await db
+          .from('departments')
+          .select('id')
+          .eq('org_id', orgId)
+          .eq('name', 'General')
+          .maybeSingle();
+        if (gen?.id) departmentId = gen.id;
+      } catch {}
+    }
+
     const placeholderDoc = {
       org_id: orgId,
       owner_user_id: userId,
       title: `[Folder] ${cleanName}`,
       filename: `${cleanName}.folder`,
       type: 'folder',
+      department_id: departmentId,
       folder_path: fullPath, // This should be an array like ['T1'] or ['Parent', 'Child']
       subject: `Folder: ${cleanName}`,
       description: `Placeholder document for folder: ${pathStr}`,
@@ -1521,6 +2544,7 @@ export function registerRoutes(app) {
         title: `[Folder] ${cleanName}`,
         filename: `${cleanName}.folder`,
         type: 'folder',
+        department_id: departmentId,
         folder_path: fullPath, // Direct array insertion
         subject: `Folder: ${cleanName}`,
         description: `Placeholder document for folder: ${pathStr}`,
@@ -1544,6 +2568,7 @@ export function registerRoutes(app) {
               title: `[Folder] ${cleanName}`,
               filename: `${cleanName}.folder`,
               type: 'folder',
+              department_id: departmentId,
               subject: `Folder: ${cleanName}`,
               description: `Placeholder document for folder: ${pathStr}`,
               tags: ['folder', 'placeholder'],
@@ -1630,64 +2655,54 @@ export function registerRoutes(app) {
     
     if (checkError) throw checkError;
     
-    // Check if folder has subfolders by looking for folders that start with our path
-    // We'll fetch all folders and check in JavaScript since PostgreSQL array operators are tricky
-    const { data: allFolders, error: subError } = await db
+    // Collect all documents in the subtree (this folder and all descendants)
+    const { data: allDocsInOrg, error: allDocsErr } = await db
       .from('documents')
-      .select('folder_path')
-      .eq('org_id', orgId)
-      .not('folder_path', 'eq', toPgArray(path));
-    
-    // Filter for subfolders in JavaScript
-    const subfolders = allFolders?.filter(doc => {
-      const folderPath = doc.folder_path;
-      if (!folderPath || folderPath.length <= path.length) return false;
-      // Check if this folder starts with our path
-      return path.every((segment, index) => folderPath[index] === segment);
-    }) || [];
-    
-    if (subError) throw subError;
-    
-    if (subfolders && subfolders.length > 0) {
-      const err = new Error('Cannot delete folder with subfolders');
-      err.statusCode = 400;
-      throw err;
-    }
-    
-    // Separate placeholder and real documents
-    const placeholder = docsInFolder?.find(d => d.type === 'folder' && d.title?.startsWith('[Folder]'));
-    const realDocs = docsInFolder?.filter(d => d.type !== 'folder' || !d.title?.startsWith('[Folder]')) || [];
+      .select('id, title, type, storage_key, filename, folder_path')
+      .eq('org_id', orgId);
+    if (allDocsErr) throw allDocsErr;
+
+    const inSubtree = (allDocsInOrg || []).filter(doc => {
+      const fp = doc.folder_path || [];
+      if (fp.length < path.length) return false;
+      return path.every((seg, i) => fp[i] === seg);
+    });
+
+    // Separate placeholder "folder" docs and real docs across the subtree
+    const subtreePlaceholders = inSubtree.filter(d => d.type === 'folder' && (d.title || '').startsWith('[Folder]'));
+    const subtreeRealDocs = inSubtree.filter(d => !(d.type === 'folder' && (d.title || '').startsWith('[Folder]')));
     
     // Handle documents based on mode
     let documentsHandled = 0;
     let storageCleanupTasks = [];
     
-    if (realDocs.length > 0) {
+    if (subtreeRealDocs.length > 0) {
       if (mode === 'move_to_root') {
-        // Move all real documents to root folder
+        // Move all real documents in the subtree to parent folder (one level up)
+        const parentPath = path.slice(0, Math.max(0, path.length - 1));
         const { error: moveError } = await db
           .from('documents')
-          .update({ folder_path: [] })
+          .update({ folder_path: parentPath })
           .eq('org_id', orgId)
-          .in('id', realDocs.map(d => d.id));
+          .in('id', subtreeRealDocs.map(d => d.id));
           
         if (moveError) throw moveError;
         
-        documentsHandled = realDocs.length;
+        documentsHandled = subtreeRealDocs.length;
         
         // Log document moves
-        for (const doc of realDocs) {
+        for (const doc of subtreeRealDocs) {
           await logAudit(app, orgId, userId, 'move', { 
             doc_id: doc.id, 
-            path: [], 
-            note: `moved to root from deleted folder: ${path.join('/')}` 
+            path: parentPath, 
+            note: `moved to parent from deleted folder: ${path.join('/')}` 
           });
         }
       } else if (mode === 'delete_all') {
-        // Delete all real documents including their storage
+        // Delete all real documents in the subtree including their storage
         const deletionTasks = [];
         
-        for (const doc of realDocs) {
+        for (const doc of subtreeRealDocs) {
           // Delete from database
           deletionTasks.push(
             db.from('documents').delete().eq('org_id', orgId).eq('id', doc.id)
@@ -1704,7 +2719,7 @@ export function registerRoutes(app) {
           }
           
           // Clean up extraction data
-          const extractionKey = `${orgId}/${doc.id}`;
+          const extractionKey = `${orgId}/${doc.id}.json`;
           storageCleanupTasks.push(
             app.supabaseAdmin.storage
               .from('extractions')
@@ -1722,19 +2737,18 @@ export function registerRoutes(app) {
           throw new Error('Failed to delete some documents in folder');
         }
         
-        documentsHandled = realDocs.length;
+        documentsHandled = subtreeRealDocs.length;
       }
     }
     
-    // Delete the placeholder document if it exists
-    if (placeholder) {
-      const { error: deleteError } = await db
+    // Delete all placeholder "folder" docs in the subtree (including the deleted folder)
+    if (subtreePlaceholders.length > 0) {
+      const { error: delPlaceholdersErr } = await db
         .from('documents')
         .delete()
         .eq('org_id', orgId)
-        .eq('id', placeholder.id);
-      
-      if (deleteError) throw deleteError;
+        .in('id', subtreePlaceholders.map(p => p.id));
+      if (delPlaceholdersErr) throw delPlaceholdersErr;
     }
     
     // Execute storage cleanup (non-blocking)
@@ -1747,10 +2761,10 @@ export function registerRoutes(app) {
     // Log the folder deletion
       await logAudit(app, orgId, userId, 'delete', { 
         path: path, 
-      note: `deleted folder: ${path.join('/')} (${documentsHandled} docs ${mode === 'move_to_root' ? 'moved to root' : 'deleted'})`,
+      note: `deleted folder: ${path.join('/')} (${documentsHandled} docs ${mode === 'move_to_root' ? 'moved to parent' : 'deleted'})`,
       mode: mode,
       documents_handled: documentsHandled,
-      storage_cleaned: mode === 'delete_all' && realDocs.some(d => d.storage_key)
+      storage_cleaned: mode === 'delete_all' && subtreeRealDocs.some(d => d.storage_key)
       });
     
     return { 
@@ -1758,8 +2772,47 @@ export function registerRoutes(app) {
       path: path.join('/'),
       mode: mode,
       documentsHandled: documentsHandled,
-      storage_cleaned: mode === 'delete_all' && realDocs.some(d => d.storage_key)
+      storage_cleaned: mode === 'delete_all' && subtreeRealDocs.some(d => d.storage_key)
     };
+  });
+
+  // Folder access sharing (multiple teams per folder)
+  app.get('/orgs/:orgId/folder-access', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+    const pathStr = String((req.query?.path || ''));
+    const pathArr = pathStr ? pathStr.split('/').filter(Boolean) : [];
+    const { data, error } = await db
+      .from('folder_access')
+      .select('department_id, path')
+      .eq('org_id', orgId)
+      .eq('path', toPgArray(pathArr));
+    if (error) throw error;
+    return { path: pathArr, departments: (data || []).map(r => r.department_id) };
+  });
+
+  app.put('/orgs/:orgId/folder-access', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+    // Admin or dept lead-permitted via RLS on folder_access
+    const Schema = z.object({ path: z.array(z.string()), departmentIds: z.array(z.string().uuid()) });
+    const { path, departmentIds } = Schema.parse(req.body || {});
+    // Strategy: delete existing rows for path, then insert new ones
+    const { error: delErr } = await db
+      .from('folder_access')
+      .delete()
+      .eq('org_id', orgId)
+      .eq('path', toPgArray(path));
+    if (delErr) throw delErr;
+    if (departmentIds.length === 0) return { ok: true };
+    const rows = departmentIds.map((deptId) => ({ org_id: orgId, path, department_id: deptId }));
+    const { error: insErr } = await db
+      .from('folder_access')
+      .insert(rows);
+    if (insErr) throw insErr;
+    return { ok: true };
   });
 
   app.get('/orgs/:orgId/search', { preHandler: app.verifyAuth }, async (req) => {
@@ -1776,6 +2829,87 @@ export function registerRoutes(app) {
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
     if (error) throw error;
     return data;
+  });
+
+  // Semantic search using pgvector doc_chunks + OpenAI embeddings
+  app.post('/orgs/:orgId/search/semantic', { preHandler: app.verifyAuth }, async (req, reply) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const Schema = z.object({ q: z.string().min(1), limit: z.number().int().min(1).max(100).optional(), threshold: z.number().min(-1).max(1).optional() });
+    const { q, limit = 20, threshold = 0 } = Schema.parse(req.body || {});
+
+    // Embed query via OpenAI REST API to avoid extra SDK deps
+    async function embedQuery(text) {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) return null;
+      const res = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
+      });
+      if (!res.ok) {
+        const errTxt = await res.text().catch(() => '');
+        throw new Error(`OpenAI embeddings error: ${res.status} ${errTxt}`);
+      }
+      const data = await res.json();
+      const emb = data?.data?.[0]?.embedding;
+      return Array.isArray(emb) ? emb : null;
+    }
+
+    let embedding = null;
+    try { embedding = await embedQuery(q); } catch (e) { req.log.warn(e, 'embed failed'); }
+
+    // If embeddings unavailable, fallback to lexical search quickly
+    if (!embedding) {
+      const s = `%${String(q).trim()}%`;
+      const { data, error } = await db
+        .from('documents')
+        .select('id, title, filename, type, uploaded_at')
+        .eq('org_id', orgId)
+        .or(`title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},description.ilike.${s}`)
+        .order('uploaded_at', { ascending: false })
+        .limit(Math.min(limit, 50));
+      if (error) throw error;
+      return { mode: 'lexical', docs: (data || []).map(d => ({ id: d.id, title: d.title || d.filename || 'Untitled', type: d.type, uploadedAt: d.uploaded_at })) };
+    }
+
+    // Vector match via RPC
+    const { data: chunks, error } = await db.rpc('match_doc_chunks', {
+      p_org_id: orgId,
+      p_query_embedding: embedding,
+      p_match_count: limit,
+      p_similarity_threshold: threshold,
+    });
+    if (error) throw error;
+
+    const rows = Array.isArray(chunks) ? chunks : [];
+    // Aggregate by document, keep best similarity and top snippets per doc
+    const byDoc = new Map();
+    for (const r of rows) {
+      const id = r.doc_id;
+      const entry = byDoc.get(id) || { id, title: r.title || r.filename || 'Untitled', type: r.doc_type, uploadedAt: r.uploaded_at, bestSimilarity: -1, snippets: [] };
+      entry.bestSimilarity = Math.max(entry.bestSimilarity, Number(r.similarity || 0));
+      if (entry.snippets.length < 3) entry.snippets.push(String(r.content || '').slice(0, 500));
+      byDoc.set(id, entry);
+    }
+    const docs = Array.from(byDoc.values()).sort((a, b) => (b.bestSimilarity - a.bestSimilarity));
+    const payload = {
+      mode: 'semantic',
+      query: q,
+      chunks: rows.map(r => ({
+        docId: r.doc_id,
+        chunkId: r.chunk_id,
+        chunkIndex: r.chunk_index,
+        snippet: String(r.content || '').slice(0, 500),
+        page: typeof r.page === 'number' ? r.page : null,
+        similarity: Number(r.similarity || 0),
+      })),
+      docs,
+    };
+    return payload;
   });
 
   // Backend OCR/metadata from Storage - download object, send as data URI
@@ -1916,6 +3050,16 @@ Document: {{media url=dataUri}}`,
       .single();
     if (error) throw error;
     await logAudit(app, orgId, userId, 'edit', { doc_id: body.documentId, note: 'file finalized' });
+
+    // Fire-and-forget ingestion (OCR/metadata via Gemini, chunking, embeddings)
+    try {
+      // Run asynchronously; do not await to keep finalize snappy
+      Promise.resolve().then(() => ingestDocument(app, { orgId, docId: body.documentId, storageKey: body.storageKey, mimeType: body.mimeType })).catch((e) => {
+        req.log?.error(e, 'ingest pipeline failed');
+      });
+    } catch (e) {
+      req.log?.warn(e, 'failed to schedule ingestion');
+    }
     return mapDbToFrontendFields(data);
   });
 
@@ -2009,17 +3153,1390 @@ Document: {{media url=dataUri}}`,
     return { url: data.signedUrl, storageKey: key, path: data.path, token: data.token };
   });
 
-  app.post('/orgs/:orgId/chat/ask', { preHandler: app.verifyAuth }, async (req, reply) => {
-    await ensureActiveMember(req);
-    const Schema = z.object({ question: z.string().min(1) });
-    const { question } = Schema.parse(req.body);
+  // Chat Orchestrator (SSE) — router → retrieval → rerank → answer → citations
+  app.post('/orgs/:orgId/chat/ask', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req, reply) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    const Schema = z.object({
+      question: z.string().min(1),
+      conversation: z
+        .array(z.object({
+          role: z.enum(['user', 'assistant']).optional(),
+          content: z.string().optional(),
+          citations: z.array(z.object({ docId: z.string().optional() })).optional(),
+        }))
+        .optional(),
+      memory: z
+        .object({
+          focusDocIds: z.array(z.string()).optional(),
+          lastCitedDocIds: z.array(z.string()).optional(),
+          filters: z
+            .object({ sender: z.string().optional(), receiver: z.string().optional(), docType: z.string().optional() })
+            .optional(),
+        })
+        .optional(),
+    });
+    const { question, conversation = [], memory: userMemory = {} } = Schema.parse(req.body || {});
+
+    // Prepare SSE
     reply.raw.setHeader('Content-Type', 'text/event-stream');
     reply.raw.setHeader('Cache-Control', 'no-cache');
     reply.raw.setHeader('Connection', 'keep-alive');
-    reply.sse({ event: 'start', data: JSON.stringify({ ok: true }) });
-    reply.sse({ event: 'delta', data: 'Answer: ' });
-    reply.sse({ event: 'delta', data: `You asked: ${question}` });
-    reply.sse({ event: 'end', data: JSON.stringify({ done: true }) });
+    const send = (event, data) => reply.sse({ event, data: typeof data === 'string' ? data : JSON.stringify(data) });
+    send('start', { ok: true });
+
+    // Load entitlements
+    const perms = await getMyPermissions(req, orgId);
+    const pf = (k, def = true) => (perms && Object.prototype.hasOwnProperty.call(perms, k) ? !!perms[k] : def);
+    const allowSnippets = pf('feature.chat.snippets', true);
+    const allowMetadata = pf('feature.chat.metadata', true);
+    const allowAnalytics = pf('feature.chat.analytics', true);
+    const allowLinked = pf('feature.chat.linked', true);
+    const allowSemantic = pf('feature.search.semantic', true);
+
+    // Conversation helpers
+    function inferFocusDocIdFromConversation(conv) {
+      // Prefer last assistant message with citations
+      for (let i = conv.length - 1; i >= 0; i--) {
+        const m = conv[i];
+        if (m && m.role === 'assistant' && Array.isArray(m.citations) && m.citations.length > 0) {
+          const id = m.citations[0]?.docId;
+          if (id) return id;
+        }
+      }
+      return null;
+    }
+
+    const focusDocId = inferFocusDocIdFromConversation(conversation);
+    const lastListDocIds = Array.isArray(userMemory.lastListDocIds) ? userMemory.lastListDocIds : [];
+    const memory = {
+      focusDocIds: (userMemory.focusDocIds && userMemory.focusDocIds.length ? userMemory.focusDocIds : (focusDocId ? [focusDocId] : [])),
+      lastCitedDocIds: (userMemory.lastCitedDocIds && userMemory.lastCitedDocIds.length
+        ? userMemory.lastCitedDocIds
+        : (conversation || [])
+            .filter(m => m?.role === 'assistant' && Array.isArray(m.citations))
+            .flatMap(m => m.citations.map(c => c.docId).filter(Boolean))),
+      lastListDocIds: lastListDocIds.length ? lastListDocIds : undefined,
+      filters: userMemory.filters || undefined,
+    };
+    const decision = await routeQuestion({ question, history: conversation, memory });
+    function choosePrimary(d) {
+      if (d && typeof d.primaryAgent === 'string') return d.primaryAgent;
+      switch (d?.intent) {
+        case 'FindFiles': return 'finder';
+        case 'Metadata': return 'metadata';
+        case 'ContentQA': return 'content';
+        case 'Linked': return 'linked';
+        case 'Diff': return 'diff';
+        case 'Analytics': return 'analytics';
+        case 'Timeline': return 'timeline';
+        case 'Extract': return 'extract';
+        default: return 'content';
+      }
+    }
+    let primary = choosePrimary(decision);
+    send('mode', { mode: primary, intent: decision.intent, confidence: decision.confidence });
+    send('stage', { agent: 'RouterAgent', step: 'classified', mode: primary, intent: decision.intent });
+
+    // If the router signals ambiguity/low confidence, ask a short clarifying question
+    const veryShort = String(question || '').trim().split(/\s+/).filter(Boolean).length < 2;
+    if (veryShort || decision?.needsClarification || (typeof decision?.confidence === 'number' && decision.confidence < 0.4)) {
+      send('delta', 'Do you want files, metadata, content Q&A, linked docs, differences, analytics, a timeline, or a field extract?');
+      send('end', { done: true, citations: [] });
+      return;
+    }
+
+    // Route adjustment: if router chose finder but the target indicates a specific doc (focus/list/ordinal),
+    // prefer a doc-focused agent (metadata/content) based on answerType/requiredFields
+    let adjusted = primary;
+    const preferDoc = (decision?.target?.prefer && decision.target.prefer !== 'none') || (Array.isArray(lastListDocIds) && lastListDocIds.length > 0) || (Array.isArray(memory.focusDocIds) && memory.focusDocIds.length > 0);
+    if (primary === 'finder' && preferDoc) {
+      const reqFields = Array.isArray(decision?.requiredFields) ? decision.requiredFields.map(String) : [];
+      const wantsMeta = decision?.answerType === 'metadata' || reqFields.some(k => /subject|sender|receiver|filename|tags|category|summary/i.test(String(k)));
+      adjusted = wantsMeta ? 'metadata' : 'content';
+      if (adjusted !== primary) {
+        primary = adjusted;
+        send('stage', { agent: 'RouterAgent', step: 'route_adjusted', mode: primary, intent: decision.intent });
+        send('mode', { mode: primary, intent: decision.intent, confidence: decision.confidence });
+      }
+    }
+
+    // Utilities for extraction load/save
+    async function loadExtraction(docId) {
+      try {
+        const { data, error } = await app.supabaseAdmin.storage.from('extractions').download(`${orgId}/${docId}.json`);
+        if (error || !data) return null;
+        const txt = await data.text();
+        return JSON.parse(txt);
+      } catch { return null; }
+    }
+    async function saveExtraction(docId, payload) {
+      try {
+        const key = `${orgId}/${docId}.json`;
+        const { error } = await app.supabaseAdmin.storage.from('extractions').upload(key, Buffer.from(JSON.stringify(payload)), { contentType: 'application/json', upsert: true });
+        if (error) throw error;
+        return true;
+      } catch { return false; }
+    }
+
+    // Normalize question for keyword checks
+    const qLower = String(question || '').toLowerCase();
+
+    // Early handling for metadata fields and linked relationships using focus/ordinals
+    // This ensures follow-ups like "first one", "its sender", "its linked docs" don't get misrouted to Finder.
+    (async () => {})();
+    const wantsLinkedEarly = /(\blink(ed)?\b|\blinks\b|\bversions?\b|\brelationships?\b)/i.test(qLower);
+    const metaAskEarly = (() => {
+      const m = qLower;
+      const wantsSubject = /\b(subject|subj)\b/.test(m);
+      const wantsSummary = /\b(summary|summarize|overview|about)\b/.test(m);
+      const wantsSender = /\b(sender|from)\b/.test(m);
+      const wantsReceiver = /\b(receiver|to)\b/.test(m);
+      const wantsDate = /\b(date|document date)\b/.test(m);
+      const wantsFilename = /\b(file(name)?|filename)\b/.test(m);
+      const wantsCategory = /\bcategory\b/.test(m);
+      const wantsTags = /\btags?\b/.test(m);
+      return { wantsSubject, wantsSummary, wantsSender, wantsReceiver, wantsDate, wantsFilename, wantsCategory, wantsTags };
+    })();
+    function canonEarly(v) {
+      const s = String(v || '').trim();
+      const map = new Map([
+        ['maharashtra state electricity distribution co. ltd.', 'MAHAVITARAN (MSEDCL)'],
+        ['mseb', 'Maharashtra State Electricity Board (MSEB)'],
+        ['mahadiscom', 'MAHAVITARAN (MSEDCL)'],
+        ['m/s bhagyalaxmi steel alloy pvt.ltd.', 'M/S BHAGYALAXMI STEEL ALLOY PVT. LTD.'],
+      ]);
+      const key = s.toLowerCase();
+      return map.get(key) || s;
+    }
+    function ordinalFromQuestionEarly(txt) {
+      const t = String(txt || '').toLowerCase();
+      const map = new Map([
+        ['first', 1], ['1st', 1], ['#1', 1],
+        ['second', 2], ['2nd', 2], ['#2', 2],
+        ['third', 3], ['3rd', 3], ['#3', 3],
+        ['fourth', 4], ['4th', 4], ['#4', 4],
+        ['fifth', 5], ['5th', 5], ['#5', 5],
+      ]);
+      for (const [k, v] of map.entries()) if (t.includes(k)) return v;
+      return null;
+    }
+    function lastAssistantCitationsEarly(conv) {
+      for (let i = conv.length - 1; i >= 0; i--) {
+        const m = conv[i];
+        if (m?.role === 'assistant' && Array.isArray(m.citations) && m.citations.length > 0) return m.citations;
+      }
+      return [];
+    }
+    // If explicitly asking for linked docs and we have a focus doc, show its relationships immediately
+    if (wantsLinkedEarly && focusDocId) {
+      // Update mode to reflect linked agent
+      send('mode', { mode: 'linked', intent: decision.intent, confidence: decision.confidence });
+      const { data: focus } = await db
+        .from('documents')
+        .select('id, title, filename, version_group_id, is_current_version')
+        .eq('org_id', orgId)
+        .eq('id', focusDocId)
+        .maybeSingle();
+      if (focus) {
+        let versions = [];
+        if (focus.version_group_id) {
+          const { data: vers } = await db
+            .from('documents')
+            .select('id, title, filename, version_number, is_current_version')
+            .eq('org_id', orgId)
+            .eq('version_group_id', focus.version_group_id);
+          versions = vers || [];
+        }
+        const { data: outgoing } = await db
+          .from('document_links')
+          .select('linked_doc_id')
+          .eq('org_id', orgId)
+          .eq('doc_id', focus.id);
+        const { data: incoming } = await db
+          .from('document_links')
+          .select('doc_id')
+          .eq('org_id', orgId)
+          .eq('linked_doc_id', focus.id);
+        const ids = new Set([
+          ...((outgoing || []).map(r => r.linked_doc_id)),
+          ...((incoming || []).map(r => r.doc_id)),
+        ]);
+        let linkedDocs = [];
+        if (ids.size) {
+          const { data: ldocs } = await db
+            .from('documents')
+            .select('id, title, filename, document_date')
+            .eq('org_id', orgId)
+            .in('id', Array.from(ids))
+            .limit(20);
+          linkedDocs = ldocs || [];
+        }
+        // Emit structured linked relationships for UI
+        try {
+          const versionsOut = (versions || []).map(v => ({ id: v.id, title: v.title || v.filename || 'Untitled', versionNumber: v.version_number || null, isCurrentVersion: !!v.is_current_version }));
+          const linkedOut = (linkedDocs || []).map(d => ({ id: d.id, title: d.title || d.filename || 'Untitled', documentDate: d.document_date || null }));
+          send('linked', { focusDocId: focus.id, versions: versionsOut, documents: linkedOut });
+        } catch {}
+        const lines = [];
+        const focusName = focus.title || focus.filename || 'Untitled';
+        lines.push(`Relationships for "${focusName}":`);
+        if (versions.length > 0) {
+          const sorted = versions.slice().sort((a,b) => (a.version_number||0) - (b.version_number||0));
+          lines.push('🔁 Versions:');
+          sorted.slice(0, 8).forEach(v => lines.push(`• v${v.version_number || 1}${v.is_current_version ? '*' : ''} — ${v.title || v.filename || 'Untitled'}`));
+        }
+        if (linkedDocs.length > 0) {
+          lines.push('📎 Linked documents:');
+          linkedDocs.slice(0, 8).forEach(d => lines.push(`• ${d.title || d.filename || 'Untitled'}${d.document_date ? ` · ${d.document_date}` : ''}`));
+        }
+        if (lines.length === 1) lines.push('No versions or explicit links found.');
+        send('delta', lines.join('\n'));
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Focused Content Q&A — if router chose ContentQA, answer using the current focus doc (citations/ordinal)
+    if (primary === 'content') {
+      // Update mode to reflect content agent
+      send('mode', { mode: 'content', intent: decision.intent, confidence: decision.confidence });
+      // Resolve target doc id
+      let targetId = focusDocId || null;
+      const ord = (decision?.target?.ordinal ? Number(decision.target.ordinal) : null) || ordinalFromQuestionEarly(question);
+      if (ord) {
+        const cites = lastAssistantCitationsEarly(conversation);
+        if (cites && cites.length >= ord) {
+          const id = cites[ord - 1]?.docId;
+          if (id) targetId = id;
+        }
+        // Fallback to last list mapping when citations don't cover the ordinal
+        if (!targetId && Array.isArray(lastListDocIds) && lastListDocIds.length >= ord) {
+          const id = lastListDocIds[ord - 1];
+          if (id) targetId = id;
+        }
+      }
+      // If router prefers focus or list and we still do not have a target, use memory hints
+      if (!targetId && decision?.target?.prefer === 'focus' && Array.isArray(memory.focusDocIds) && memory.focusDocIds.length > 0) {
+        targetId = memory.focusDocIds[0];
+      }
+      if (!targetId && decision?.target?.prefer === 'list' && Array.isArray(lastListDocIds) && lastListDocIds.length > 0) {
+        targetId = lastListDocIds[0];
+      }
+      if (!targetId) {
+        // If no focus, proceed to generic snippets later
+      } else {
+        try {
+          send('stage', { agent: 'ContentAgent', step: 'loading' });
+          // Try to load OCR extraction for better recall
+          const ex = await loadExtraction(targetId);
+          let contextText = '';
+          if (ex?.ocrText && String(ex.ocrText).trim().length > 0) {
+            contextText = String(ex.ocrText).slice(0, 20000);
+            send('stage', { agent: 'ContentAgent', step: 'using_ocr' });
+          } else {
+            // Fall back to semantic chunks and restrict to this doc
+            const embedding = allowSemantic ? await embedQuery(question).catch(() => null) : null;
+            let chunks = [];
+            if (embedding) {
+              const { data, error } = await db.rpc('match_doc_chunks', {
+                p_org_id: orgId,
+                p_query_embedding: embedding,
+                p_match_count: 24,
+                p_similarity_threshold: 0
+              });
+              if (!error && Array.isArray(data)) chunks = data.filter(r => r.doc_id === targetId);
+            }
+            // Build context from top chunks or lightweight metadata
+            if (chunks.length > 0) {
+              const byScore = chunks.slice().sort((a,b) => Number(b.similarity||0) - Number(a.similarity||0));
+              contextText = byScore.map(r => String(r.content||'')).slice(0, 6).join('\n---\n');
+              send('stage', { agent: 'ContentAgent', step: 'using_chunks', count: chunks.length });
+            } else {
+              // As a last resort, include title/subject/meta as minimal context
+              const { data: doc } = await db
+                .from('documents')
+                .select('title, subject, sender, receiver, category, document_date, filename')
+                .eq('org_id', orgId)
+                .eq('id', targetId)
+                .maybeSingle();
+              contextText = [doc?.title, doc?.subject, doc?.sender, doc?.receiver, doc?.category, doc?.document_date, doc?.filename]
+                .filter(Boolean).join(' \n ');
+              send('stage', { agent: 'ContentAgent', step: 'using_metadata' });
+            }
+
+          }
+
+          // Structured extraction for bill fields when explicitly requested via router
+          const reqFields = Array.isArray(decision?.requiredFields) ? decision.requiredFields.map(String) : [];
+          let structuredLine = '';
+          if (reqFields.some(k => /amount|total|due|billing|month|year/i.test(k))) {
+            try {
+              const extractPrompt = ai.definePrompt({
+                name: 'extractBillFields',
+                input: { schema: z.object({ text: z.string() }) },
+                output: { schema: z.object({ amount: z.string().optional(), currency: z.string().optional(), billingMonth: z.string().optional(), billingYear: z.string().optional(), dueDate: z.string().optional() }) },
+                prompt: `From the given document text, extract electricity bill fields as JSON: {amount,currency,billingMonth,billingYear,dueDate}.\n- Use numeric format for amount (no commas), 2 decimals if present.\n- Month as MMM or full name, year as YYYY.\n- If unknown, omit the key.\n\nText:\n{{text}}`,
+              });
+              const { output } = await extractPrompt({ text: contextText.slice(0, 12000) });
+              const amt = output?.amount; const cur = output?.currency || '₹';
+              const mon = output?.billingMonth; const yr = output?.billingYear;
+              if (amt && (mon || yr)) structuredLine = `The bill is ${cur}${amt}${(mon||yr) ? ` for ${[mon,yr].filter(Boolean).join(' ')}` : ''}.`;
+              // Persist parsed fields for reuse
+              const exNow = await loadExtraction(targetId);
+              const merged = { ...(exNow || {}), metadata: { ...((exNow&&exNow.metadata)||{}), billFields: output || {} } };
+              await saveExtraction(targetId, merged);
+            } catch {}
+          }
+
+          // Answer with LLM using context (include short conversation history for pronoun resolution)
+          const qaPrompt = ai.definePrompt({
+            name: 'focusedDocAnswer',
+            input: { schema: z.object({ q: z.string(), ctx: z.string(), history: z.array(z.object({ role: z.string(), content: z.string() })).optional() }) },
+            output: { schema: z.object({ answer: z.string() }) },
+            prompt: `You answer questions about a single focused document using ONLY the provided context.\n- Be concise.\n- If asked for amount, return the numeric total or due amount explicitly.\n- If asked for month/date, return the month/year explicitly.\n- If unclear, say what is missing.\n- Use the short history below to resolve pronouns like it/this/that.\n\nQuestion: {{{q}}}\n\nHistory:\n{{#each history}}- {{role}}: {{{content}}}\n{{/each}}\n\nContext:\n{{{ctx}}}`,
+          });
+          send('stage', { agent: 'ContentAgent', step: 'answering' });
+          let answerText = '';
+          try {
+            const shortHist = (conversation || []).slice(-4).map(m => ({ role: m.role || 'user', content: m.content || '' }));
+            const { output } = await qaPrompt({ q: question, ctx: contextText, history: shortHist });
+            answerText = output?.answer || '';
+          } catch {}
+
+          if (!answerText.trim() && structuredLine) answerText = structuredLine;
+          if (!answerText.trim()) answerText = 'I could not find that in the current document.';
+          // Optional: emit a small preview block when user asks to preview/show the document
+          try {
+            const wantsPreview = /(\bpreview\b|\bshow\s+(the\s+)?(doc|document)\b|\bopen\s+(the\s+)?(doc|document)\b)/i.test(qLower);
+            if (wantsPreview) {
+              const lines = String(contextText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 5);
+              const { data: nameRow } = await db
+                .from('documents')
+                .select('title, filename')
+                .eq('org_id', orgId)
+                .eq('id', targetId)
+                .maybeSingle();
+              const pTitle = nameRow?.title || nameRow?.filename || 'Document';
+              send('preview', { docId: targetId, title: pTitle, lines });
+            }
+          } catch {}
+          send('delta', answerText);
+          // Best-effort citation to the focused doc
+          send('end', { done: true, citations: [{ docId: targetId, page: null, snippet: '' }] });
+          return;
+        } catch (e) {
+          // Fall through to generic flow on errors
+        }
+      }
+    }
+
+    // If explicitly asking for metadata fields, answer directly for the focus/ordinal doc
+    if (metaAskEarly.wantsSubject || metaAskEarly.wantsSummary || metaAskEarly.wantsSender || metaAskEarly.wantsReceiver || metaAskEarly.wantsDate || metaAskEarly.wantsFilename || metaAskEarly.wantsCategory || metaAskEarly.wantsTags) {
+      // Update mode to reflect metadata agent
+      send('mode', { mode: 'metadata', intent: decision.intent, confidence: decision.confidence });
+      let targetId = focusDocId || null;
+      const ord = ordinalFromQuestionEarly(question);
+      if (ord) {
+        const cites = lastAssistantCitationsEarly(conversation);
+        if (cites && cites.length >= ord) {
+          const id = cites[ord - 1]?.docId;
+          if (id) targetId = id;
+        }
+        // Fallback to last list mapping when citations don't cover the ordinal
+        if (!targetId && Array.isArray(lastListDocIds) && lastListDocIds.length >= ord) {
+          const id = lastListDocIds[ord - 1];
+          if (id) targetId = id;
+        }
+      }
+      if (targetId) {
+        send('stage', { agent: 'MetadataAgent', step: 'loading' });
+        const { data: doc } = await db
+          .from('documents')
+          .select('title, filename, subject, sender, receiver, document_date, category, tags')
+          .eq('org_id', orgId)
+          .eq('id', targetId)
+          .maybeSingle();
+        const lines = [];
+        if (metaAskEarly.wantsSubject) lines.push(`Subject: ${doc?.subject || '—'}`);
+        if (metaAskEarly.wantsSender) lines.push(`Sender: ${doc?.sender ? canonEarly(doc.sender) : '—'}`);
+        if (metaAskEarly.wantsReceiver) lines.push(`Receiver: ${doc?.receiver ? canonEarly(doc.receiver) : '—'}`);
+        if (metaAskEarly.wantsDate) lines.push(`Date: ${doc?.document_date || '—'}`);
+        if (metaAskEarly.wantsFilename) lines.push(`Filename: ${doc?.filename || doc?.title || '—'}`);
+        if (metaAskEarly.wantsCategory) lines.push(`Category: ${doc?.category || '—'}`);
+        if (metaAskEarly.wantsTags) lines.push(`Tags: ${(doc?.tags || []).join(', ') || '—'}`);
+
+        // Emit structured metadata block for UI (include canonical variants)
+        try {
+          send('metadata', {
+            docId: targetId,
+            subject: doc?.subject || null,
+            sender: doc?.sender || null,
+            senderCanonical: doc?.sender ? canonEarly(doc.sender) : null,
+            receiver: doc?.receiver || null,
+            receiverCanonical: doc?.receiver ? canonEarly(doc.receiver) : null,
+            date: doc?.document_date || null,
+            filename: doc?.filename || doc?.title || null,
+            category: doc?.category || null,
+            tags: Array.isArray(doc?.tags) ? doc?.tags : [],
+            name: doc?.title || doc?.filename || 'Untitled',
+          });
+        } catch {}
+
+        if (metaAskEarly.wantsSummary) {
+          send('stage', { agent: 'MetadataAgent', step: 'fetching_summary' });
+          let summaryText = '';
+          const ex = await loadExtraction(targetId);
+          if (ex?.metadata?.summary) summaryText = String(ex.metadata.summary);
+          else if ((ex?.ocrText || '').trim().length > 0) {
+            try {
+              const summarizePrompt = ai.definePrompt({
+                name: 'docSummaryMetadataOnly',
+                input: { schema: z.object({ text: z.string() }) },
+                output: { schema: z.object({ summary: z.string() }) },
+                prompt: `Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.\n\nText:\n{{text}}`,
+              });
+              const { output } = await summarizePrompt({ text: ex.ocrText.slice(0, 12000) });
+              summaryText = output?.summary || '';
+              const merged = { ...ex, metadata: { ...(ex?.metadata || {}), summary: summaryText } };
+              await saveExtraction(targetId, merged);
+              send('stage', { agent: 'MetadataAgent', step: 'summary_generated' });
+            } catch {}
+          }
+          // Fallback: use subject/title/category when OCR summary not available
+          lines.unshift('Summary:');
+          if (summaryText) lines.push(summaryText);
+          else if (doc?.subject) lines.push(doc.subject);
+          else if (doc?.title || doc?.category) lines.push([doc?.title, doc?.category].filter(Boolean).join(' — '));
+          else lines.push('No summary available.');
+        }
+        if (lines.length) {
+          send('delta', lines.join('\n'));
+          send('end', { done: true, citations: [{ docId: targetId, page: null, snippet: '' }] });
+          return;
+        }
+      }
+    }
+
+    // If explicitly asking for linked docs and we have a focus doc, show its relationships immediately
+    if (primary === 'linked' && wantsLinkedEarly && focusDocId) {
+      send('mode', { mode: 'linked', intent: decision.intent, confidence: decision.confidence });
+      const { data: focus } = await db
+        .from('documents')
+        .select('id, title, filename, version_group_id, is_current_version')
+        .eq('org_id', orgId)
+        .eq('id', focusDocId)
+        .maybeSingle();
+      if (focus) {
+        let versions = [];
+        if (focus.version_group_id) {
+          const { data: vers } = await db
+            .from('documents')
+            .select('id, title, filename, version_number, is_current_version')
+            .eq('org_id', orgId)
+            .eq('version_group_id', focus.version_group_id);
+          versions = vers || [];
+        }
+        const { data: outgoing } = await db
+          .from('document_links')
+          .select('linked_doc_id')
+          .eq('org_id', orgId)
+          .eq('doc_id', focus.id);
+        const { data: incoming } = await db
+          .from('document_links')
+          .select('doc_id')
+          .eq('org_id', orgId)
+          .eq('linked_doc_id', focus.id);
+        const ids = new Set([
+          ...((outgoing || []).map(r => r.linked_doc_id)),
+          ...((incoming || []).map(r => r.doc_id)),
+        ]);
+        let linkedDocs = [];
+        if (ids.size) {
+          const { data: ldocs } = await db
+            .from('documents')
+            .select('id, title, filename, document_date')
+            .eq('org_id', orgId)
+            .in('id', Array.from(ids))
+            .limit(20);
+          linkedDocs = ldocs || [];
+        }
+        // Emit structured linked relationships for UI
+        try {
+          const versionsOut = (versions || []).map(v => ({ id: v.id, title: v.title || v.filename || 'Untitled', versionNumber: v.version_number || null, isCurrentVersion: !!v.is_current_version }));
+          const linkedOut = (linkedDocs || []).map(d => ({ id: d.id, title: d.title || d.filename || 'Untitled', documentDate: d.document_date || null }));
+          send('linked', { focusDocId: focus.id, versions: versionsOut, documents: linkedOut });
+        } catch {}
+        const lines = [];
+        const focusName = focus.title || focus.filename || 'Untitled';
+        lines.push(`Relationships for "${focusName}":`);
+        if (versions.length > 0) {
+          const sorted = versions.slice().sort((a,b) => (a.version_number||0) - (b.version_number||0));
+          lines.push('🔁 Versions:');
+          sorted.slice(0, 8).forEach(v => lines.push(`• v${v.version_number || 1}${v.is_current_version ? '*' : ''} — ${v.title || v.filename || 'Untitled'}`));
+        }
+        if (linkedDocs.length > 0) {
+          lines.push('📎 Linked documents:');
+          linkedDocs.slice(0, 8).forEach(d => lines.push(`• ${d.title || d.filename || 'Untitled'}${d.document_date ? ` · ${d.document_date}` : ''}`));
+        }
+        if (lines.length === 1) lines.push('No versions or explicit links found.');
+        send('delta', lines.join('\n'));
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Finder mode — list/search documents (explicit file finding)
+    if (primary === 'finder') {
+      try {
+        send('stage', { agent: 'FinderAgent', step: 'searching' });
+
+        const f = decision.filters || {};
+        const cleaned = String(question || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        const tokens = Array.from(new Set(cleaned.split(' ').filter(t => t.length >= 3)));
+        if (f.docType) tokens.push(String(f.docType).toLowerCase());
+        if (Array.isArray(f.keywords)) tokens.push(...f.keywords.map(k => String(k||'').toLowerCase()).filter(Boolean));
+        const tokenSet = new Set(tokens);
+
+        // 1) Semantic retrieval (if allowed)
+        let semDocs = [];
+        if (allowSemantic) {
+          const embedding = await embedQuery(question).catch(() => null);
+          if (embedding) {
+            const { data: chunks, error: matchErr } = await db.rpc('match_doc_chunks', {
+              p_org_id: orgId,
+              p_query_embedding: embedding,
+              p_match_count: 50,
+              p_similarity_threshold: 0
+            });
+            if (!matchErr && Array.isArray(chunks)) {
+              const bestByDoc = new Map();
+              for (const r of chunks) {
+                const id = r.doc_id; const score = Number(r.similarity || 0);
+                const prev = bestByDoc.get(id);
+                if (!prev || score > prev) bestByDoc.set(id, score);
+              }
+              const ids = Array.from(bestByDoc.entries()).sort((a,b) => b[1]-a[1]).map(([id]) => id);
+              if (ids.length) {
+                const { data: docsRows } = await db
+                  .from('documents')
+                  .select('id, title, filename, subject, document_date, type, sender, receiver, category')
+                  .eq('org_id', orgId)
+                  .in('id', ids.slice(0, 50));
+                semDocs = (docsRows || []).filter(d => d && d.id);
+                // Optional: apply sender/receiver/category post-filters
+                if (f.sender) semDocs = semDocs.filter(d => String(d.sender||'').toLowerCase().includes(String(f.sender).toLowerCase()));
+                if (f.receiver) semDocs = semDocs.filter(d => String(d.receiver||'').toLowerCase().includes(String(f.receiver).toLowerCase()));
+                if (f.category) semDocs = semDocs.filter(d => String(d.category||'').toLowerCase().includes(String(f.category).toLowerCase()));
+                // Soft docType filter: match docType against type/category/title/subject
+                if (f.docType) {
+                  const dt = String(f.docType).toLowerCase();
+                  semDocs = semDocs.filter(d => [d.type, d.category, d.title, d.subject, d.filename].some(v => String(v||'').toLowerCase().includes(dt)));
+                }
+                // Sort semDocs by the best similarity order
+                const order = new Map(ids.map((id, idx) => [id, idx]));
+                semDocs.sort((a,b) => (order.get(a.id)||9999) - (order.get(b.id)||9999));
+              }
+            }
+          }
+        }
+
+        // 2) LLM-based query expansion to improve recall (typos/synonyms)
+        async function expandQueryLLM(q) {
+          try {
+            const expPrompt = ai.definePrompt({
+              name: 'queryExpander',
+              input: { schema: z.object({ q: z.string() }) },
+              output: { schema: z.object({ terms: z.array(z.string()) }) },
+              prompt: `Given a short search query, output a small set (<= 6) of normalized tokens and synonyms that improve document search recall.\n- Correct obvious typos.\n- Prefer singular forms.\n- Include common synonyms (e.g., invoice for bill).\n- Return JSON: {\"terms\":[...]}.\n\nQuery: {{{q}}}`,
+            });
+            const { output } = await expPrompt({ q });
+            return Array.isArray(output?.terms) ? output.terms.map(t => String(t||'').toLowerCase()).filter(Boolean) : [];
+          } catch { return []; }
+        }
+
+        // 3) Lexical retrieval over multiple fields with tokens (with expansion)
+        const qb = db
+          .from('documents')
+          .select('id, title, filename, subject, document_date, type, sender, receiver, category')
+          .eq('org_id', orgId)
+          .order('uploaded_at', { ascending: false })
+          .limit(80);
+        const ilike = (v) => (v ? `%${v}%` : null);
+        // Apply strong filters for sender/receiver/category only
+        if (f.sender) qb.ilike('sender', ilike(f.sender));
+        if (f.receiver) qb.ilike('receiver', ilike(f.receiver));
+        if (f.category) qb.ilike('category', ilike(f.category));
+        const fields = ['title','subject','filename','sender','receiver','category','type'];
+        let allTokens = tokens.slice(0);
+        const expanded = await expandQueryLLM(question).catch(() => []);
+        if (Array.isArray(expanded) && expanded.length) allTokens.push(...expanded);
+        allTokens = Array.from(new Set(allTokens.filter(Boolean)));
+        if (allTokens.length > 0) {
+          const ors = [];
+          for (const t of allTokens) {
+            const s = `%${t}%`;
+            for (const field of fields) ors.push(`${field}.ilike.${s}`);
+          }
+          if (ors.length > 0) qb.or(ors.join(','));
+        } else {
+          const s = `%${question.trim()}%`;
+          qb.or(`title.ilike.${s},subject.ilike.${s},filename.ilike.${s},sender.ilike.${s},receiver.ilike.${s},type.ilike.${s},category.ilike.${s}`);
+        }
+        const { data: lexRowsRaw, error: lexErr } = await qb;
+        const lexRows = (!lexErr && Array.isArray(lexRowsRaw)) ? lexRowsRaw : [];
+
+        // 3) Merge semantic-first then lexical (dedupe by id)
+        const merged = new Map();
+        for (const d of semDocs) if (d && d.id) merged.set(d.id, d);
+        for (const d of lexRows) if (d && d.id && !merged.has(d.id)) merged.set(d.id, d);
+        let rows = Array.from(merged.values());
+
+        // If 0 rows and looks like relationships ask, fallback to Linked summary
+        if (rows.length === 0 && (tokenSet.has('linked') || tokenSet.has('links') || tokenSet.has('versions') || tokenSet.has('related'))) {
+          send('stage', { agent: 'RelationsAgent', step: 'summarizing_corpus_links' });
+          const { data: links } = await db
+            .from('document_links')
+            .select('doc_id, linked_doc_id')
+            .eq('org_id', orgId)
+            .limit(500);
+          const { data: docs } = await db
+            .from('documents')
+            .select('id, title, filename, version_group_id, is_current_version, document_date')
+            .eq('org_id', orgId)
+            .order('uploaded_at', { ascending: false })
+            .limit(500);
+          const withLinks = new Set((links || []).flatMap(r => [r.doc_id, r.linked_doc_id]).filter(Boolean));
+          const versionGroups = new Map();
+          (docs || []).forEach(d => { if (d.version_group_id) { if (!versionGroups.has(d.version_group_id)) versionGroups.set(d.version_group_id, []); versionGroups.get(d.version_group_id).push(d); } });
+          const groups = Array.from(versionGroups.values()).filter(arr => arr.length > 1);
+          const bySource = new Map();
+          (links || []).forEach(l => { if (!bySource.has(l.doc_id)) bySource.set(l.doc_id, new Set()); bySource.get(l.doc_id).add(l.linked_doc_id); });
+          const nameOf = (id) => { const d = (docs || []).find(x => x.id === id); return d ? (d.title || d.filename || 'Untitled') : id; };
+          const pairs = [];
+          for (const [src, set] of bySource.entries()) for (const dst of set) pairs.push([src, dst]);
+          const out = [];
+          out.push(`Found ${withLinks.size} documents with explicit links and ${groups.length} version groups.`);
+          if (groups.length > 0) {
+            out.push(''); out.push('Version Groups:');
+            for (const group of groups.slice(0, 5)) {
+              const sorted = group.slice().sort((a,b) => (a.version_number||0) - (b.version_number||0));
+              const label = (d) => `${(d.title || d.filename || 'Untitled')}${d.is_current_version ? ' (current)' : ''}`;
+              out.push('• ' + sorted.map(label).join(' → '));
+            }
+          }
+          if (pairs.length > 0) {
+            out.push(''); out.push('Linked Documents:');
+            pairs.slice(0, 8).forEach(([a,b]) => out.push(`• ${nameOf(a)} ↔ ${nameOf(b)}`));
+          }
+          send('delta', out.join('\n'));
+          send('end', { done: true, citations: [] });
+          return;
+        }
+
+        if (rows.length === 0) {
+          send('delta', 'No matching documents. Try narrowing by sender, type, or month.');
+          send('end', { done: true, citations: [] });
+          return;
+        }
+
+        const lines = [];
+        const name = (d) => d.title || d.filename || 'Untitled';
+        lines.push(`Found ${rows.length} documents:`);
+        rows.slice(0, 12).forEach((d) => {
+          const bits = [name(d)];
+          if (d.document_date) bits.push(d.document_date);
+          if (d.sender) bits.push(d.sender);
+          if (d.type) bits.push(d.type);
+          lines.push('• ' + bits.join(' · '));
+        });
+        if (rows.length > 12) lines.push(`• ... and ${rows.length - 12} more`);
+        send('delta', lines.join('\n'));
+        // Emit ordered list mapping for deterministic ordinal follow-ups
+        try {
+          send('list', { items: rows.slice(0, 12).map((d, idx) => ({ index: idx + 1, docId: d.id, title: name(d) })) });
+        } catch {}
+        const cites = rows.slice(0, 3).map((d) => ({ docId: d.id, page: null, snippet: '', docName: name(d) }));
+        send('end', { done: true, citations: cites });
+        return;
+      } catch (e) {
+        send('delta', `Error finding files: ${e?.message || 'Unknown error'}`);
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Metadata mode (simple filter over documents)
+    if (primary === 'metadata' && allowMetadata) {
+      try {
+        send('stage', { agent: 'FinderAgent', step: 'searching_metadata' });
+        const s = `%${question.trim()}%`;
+        const { data, error } = await db
+          .from('documents')
+          .select('id, title, filename, type, uploaded_at, sender, receiver, subject, category, document_date')
+          .eq('org_id', orgId)
+          .or(`title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},type.ilike.${s},category.ilike.${s}`)
+          .order('uploaded_at', { ascending: false })
+          .limit(20);
+        if (error) throw error;
+        const rows = data || [];
+        const count = rows.length;
+        send('stage', { agent: 'FinderAgent', step: 'found', count });
+        if (count > 0) {
+          const name = (d) => d.title || d.filename || 'Untitled';
+          const lines = [];
+          lines.push(`Found ${count} matching documents:`);
+          rows.slice(0, 8).forEach(d => {
+            const bits = [name(d)];
+            if (d.document_date) bits.push(d.document_date);
+            if (d.sender) bits.push(d.sender);
+            if (d.type) bits.push(d.type);
+            lines.push('• ' + bits.join(' · '));
+          });
+          if (count > 8) lines.push(`• ... and ${count - 8} more`);
+          send('delta', lines.join('\n'));
+          // Emit ordered list mapping for deterministic ordinal follow-ups
+          try {
+            send('list', { items: rows.slice(0, 8).map((d, idx) => ({ index: idx + 1, docId: d.id, title: name(d) })) });
+          } catch {}
+          const cites = rows.slice(0, 3).map(d => ({ docId: d.id, page: null, snippet: '', docName: d.title || d.filename || 'Untitled' }));
+          send('end', { done: true, citations: cites });
+        } else {
+          send('delta', 'No matching documents.');
+          send('end', { done: true, citations: [] });
+        }
+        return;
+      } catch (e) {
+        send('delta', `Error fetching metadata: ${e?.message || 'Unknown error'}`);
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Linked mode — summarize both version groups and explicit links distinctly
+    if (primary === 'linked' && allowLinked) {
+      // If a focus doc is known from conversation ("it", citations), show its relationships
+      if (focusDocId) {
+        // Get focus doc
+        const { data: focus } = await db
+          .from('documents')
+          .select('id, title, filename, version_group_id, is_current_version')
+          .eq('org_id', orgId)
+          .eq('id', focusDocId)
+          .maybeSingle();
+        if (focus) {
+          // Versions in group
+          let versions = [];
+          if (focus.version_group_id) {
+            const { data: vers } = await db
+              .from('documents')
+              .select('id, title, filename, version_number, is_current_version')
+              .eq('org_id', orgId)
+              .eq('version_group_id', focus.version_group_id);
+            versions = vers || [];
+          }
+          // Outgoing/incoming links
+          const { data: outgoing } = await db
+            .from('document_links')
+            .select('linked_doc_id')
+            .eq('org_id', orgId)
+            .eq('doc_id', focus.id);
+          const { data: incoming } = await db
+            .from('document_links')
+            .select('doc_id')
+            .eq('org_id', orgId)
+            .eq('linked_doc_id', focus.id);
+          const ids = new Set([
+            ...((outgoing || []).map(r => r.linked_doc_id)),
+            ...((incoming || []).map(r => r.doc_id)),
+          ]);
+          const idList = Array.from(ids);
+          let linkedDocs = [];
+          if (idList.length) {
+            const { data: ldocs } = await db
+              .from('documents')
+              .select('id, title, filename, document_date')
+              .eq('org_id', orgId)
+              .in('id', idList)
+              .limit(20);
+            linkedDocs = ldocs || [];
+          }
+          // Emit structured linked relationships for UI
+          try {
+            const versionsOut = (versions || []).map(v => ({ id: v.id, title: v.title || v.filename || 'Untitled', versionNumber: v.version_number || null, isCurrentVersion: !!v.is_current_version }));
+            const linkedOut = (linkedDocs || []).map(d => ({ id: d.id, title: d.title || d.filename || 'Untitled', documentDate: d.document_date || null }));
+            send('linked', { focusDocId: focus.id, versions: versionsOut, documents: linkedOut });
+          } catch {}
+          const lines = [];
+          const focusName = focus.title || focus.filename || 'Untitled';
+          lines.push(`Relationships for "${focusName}":`);
+          if (versions.length > 0) {
+            const sorted = versions.slice().sort((a,b) => (a.version_number||0) - (b.version_number||0));
+            lines.push('🔁 Versions:');
+            sorted.slice(0, 8).forEach(v => lines.push(`• v${v.version_number || 1}${v.is_current_version ? '*' : ''} — ${v.title || v.filename || 'Untitled'}`));
+            if (sorted.length > 8) lines.push(`• ... and ${sorted.length - 8} more versions`);
+          }
+          if (linkedDocs.length > 0) {
+            lines.push('📎 Linked documents:');
+            linkedDocs.slice(0, 8).forEach(d => lines.push(`• ${d.title || d.filename || 'Untitled'}${d.document_date ? ` · ${d.document_date}` : ''}`));
+            if (linkedDocs.length > 8) lines.push(`• ... and ${linkedDocs.length - 8} more links`);
+          }
+          if (lines.length === 1) lines.push('No versions or explicit links found.');
+          send('delta', lines.join('\n'));
+          send('end', { done: true, citations: [] });
+          return;
+        }
+      }
+
+      // Explicit links (general summary)
+      send('stage', { agent: 'RelationsAgent', step: 'summarizing_corpus_links' });
+      const { data: links } = await db
+        .from('document_links')
+        .select('doc_id, linked_doc_id')
+        .eq('org_id', orgId)
+        .limit(500);
+      // Docs with version groups
+      const { data: docs } = await db
+        .from('documents')
+        .select('id, title, filename, version_group_id, is_current_version, document_date')
+        .eq('org_id', orgId)
+        .order('uploaded_at', { ascending: false })
+        .limit(500);
+      const withLinks = new Set((links || []).flatMap(r => [r.doc_id, r.linked_doc_id]).filter(Boolean));
+      const versionGroups = new Map();
+      (docs || []).forEach(d => { if (d.version_group_id) { if (!versionGroups.has(d.version_group_id)) versionGroups.set(d.version_group_id, []); versionGroups.get(d.version_group_id).push(d); } });
+      const groups = Array.from(versionGroups.values()).filter(arr => arr.length > 1);
+      // Build readable output (limited samples for scale)
+      const lines = [];
+      lines.push(`Found ${withLinks.size} documents with explicit links and ${groups.length} version groups.`);
+      // Version groups summary
+      if (groups.length > 0) {
+        lines.push('');
+        lines.push('Version Groups:');
+        for (const group of groups.slice(0, 5)) {
+          const sorted = group.slice().sort((a,b) => (a.version_number||0) - (b.version_number||0));
+          const name = (d) => d.title || d.filename || 'Untitled';
+          lines.push('• ' + sorted.map(d => `${name(d)}${d.is_current_version ? ' (current)' : ''}`).join(' → '));
+        }
+        if (groups.length > 5) lines.push(`• ... and ${groups.length - 5} more groups`);
+      }
+      // Explicit links (sample)
+      const bySource = new Map();
+      (links || []).forEach(l => {
+        if (!bySource.has(l.doc_id)) bySource.set(l.doc_id, new Set());
+        bySource.get(l.doc_id).add(l.linked_doc_id);
+      });
+      const name = (id) => { const d = (docs || []).find(x => x.id === id); return d ? (d.title || d.filename || 'Untitled') : id; };
+      const pairs = [];
+      for (const [src, set] of bySource.entries()) {
+        for (const dst of set) pairs.push([src, dst]);
+      }
+      if (pairs.length > 0) {
+        lines.push('');
+        lines.push('Linked Documents:');
+        pairs.slice(0, 8).forEach(([a,b]) => lines.push(`• ${name(a)} ↔ ${name(b)}`));
+        if (pairs.length > 8) lines.push(`• ... and ${pairs.length - 8} more links`);
+      }
+      lines.push('');
+      lines.push('Tip: Ask "linked docs for <title>" or "more links for <title>" to see details for a specific document.');
+      send('delta', lines.join('\n'));
+      send('end', { done: true, citations: [] });
+      return;
+    }
+
+    // Timeline mode — chronological view for an entity (sender/receiver/title match)
+    if (decision.intent === 'Timeline') {
+      try {
+        send('stage', { agent: 'TimelineAgent', step: 'loading' });
+        const entity = String(decision?.filters?.entity || '').trim() || '';
+        if (!entity) {
+          send('delta', 'Who should the timeline be about? Try: "timeline for <entity>".');
+          send('end', { done: true, citations: [] });
+          return;
+        }
+        const s = `%${entity}%`;
+        const { data, error } = await db
+          .from('documents')
+          .select('id, title, filename, document_date, type, sender, receiver')
+          .eq('org_id', orgId)
+          .or(`sender.ilike.${s},receiver.ilike.${s},title.ilike.${s},filename.ilike.${s}`)
+          .order('document_date', { ascending: true })
+          .limit(50);
+        if (error) throw error;
+        const rows = data || [];
+        if (rows.length === 0) {
+          send('delta', `No timeline entries found for "${entity}".`);
+          send('end', { done: true, citations: [] });
+          return;
+        }
+        const name = (d) => d.title || d.filename || 'Untitled';
+        const lines = [];
+        lines.push(`Timeline for ${entity}:`);
+        rows.forEach(d => {
+          const when = d.document_date || '';
+          const what = name(d);
+          const typ = d.type ? ` (${d.type})` : '';
+          lines.push(`- ${when} · ${what}${typ}`);
+        });
+        send('delta', lines.join('\n'));
+        try { send('list', { items: rows.slice(0, 20).map((d, idx) => ({ index: idx + 1, docId: d.id, title: name(d) })) }); } catch {}
+        const cites = rows.slice(0, 3).map(d => ({ docId: d.id, page: null, snippet: '', docName: name(d) }));
+        send('end', { done: true, citations: cites });
+        return;
+      } catch (e) {
+        send('delta', `Error building timeline: ${e?.message || 'Unknown error'}`);
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Extract mode — project selected fields across matching documents
+    if (decision.intent === 'Extract') {
+      try {
+        send('stage', { agent: 'ExtractAgent', step: 'loading' });
+        const fields = Array.isArray(decision?.filters?.fields) ? decision.filters.fields.filter(Boolean) : [];
+        if (!fields.length) {
+          send('delta', 'Which fields should I extract? Example: fields: id,title,document_date,type');
+          send('end', { done: true, citations: [] });
+          return;
+        }
+        const f = decision.filters || {};
+        const qb = db
+          .from('documents')
+          .select('id, title, filename, type, document_date, sender, receiver, category, tags')
+          .eq('org_id', orgId)
+          .order('uploaded_at', { ascending: false })
+          .limit(200);
+        const ilike = (v) => (v ? `%${v}%` : null);
+        if (f.sender) qb.ilike('sender', ilike(f.sender));
+        if (f.receiver) qb.ilike('receiver', ilike(f.receiver));
+        if (f.docType) qb.ilike('type', ilike(f.docType));
+        if (f.month) qb.ilike('document_date', ilike(f.month));
+        const { data, error } = await qb;
+        if (error) throw error;
+        const rows = data || [];
+        const name = (d) => d.title || d.filename || 'Untitled';
+        const fmt = (d, k) => {
+          if (k === 'id') return d.id;
+          if (k === 'name') return name(d);
+          if (k === 'title') return d.title || '';
+          if (k === 'filename') return d.filename || '';
+          if (k === 'type' || k === 'documentType') return d.type || '';
+          if (k === 'document_date' || k === 'documentDate') return d.document_date || '';
+          if (k === 'sender') return d.sender || '';
+          if (k === 'receiver') return d.receiver || '';
+          if (k === 'category') return d.category || '';
+          if (k === 'tags') return Array.isArray(d.tags) ? d.tags.join('|') : '';
+          return '';
+        };
+        const header = `Extracted ${rows.length} records (fields: ${fields.join(', ')}):`;
+        const lines = [header];
+        rows.slice(0, 20).forEach(d => {
+          const parts = fields.map(k => `${k}: ${fmt(d, k)}`);
+          lines.push('• ' + parts.join('; '));
+        });
+        if (rows.length > 20) lines.push(`• ... and ${rows.length - 20} more`);
+        send('delta', lines.join('\n'));
+        try { send('list', { items: rows.slice(0, 20).map((d, idx) => ({ index: idx + 1, docId: d.id, title: name(d) })) }); } catch {}
+        const cites = rows.slice(0, 3).map(d => ({ docId: d.id, page: null, snippet: '', docName: name(d) }));
+        send('end', { done: true, citations: cites });
+        return;
+      } catch (e) {
+        send('delta', `Error extracting fields: ${e?.message || 'Unknown error'}`);
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
+    // Analytics mode — basic count by sender (example)
+    if (primary === 'analytics' && allowAnalytics) {
+      send('stage', { agent: 'AnalyticsAgent', step: 'computing' });
+      const s = `%${question.trim()}%`;
+      const { data, error } = await db
+        .from('documents')
+        .select('sender')
+        .eq('org_id', orgId)
+        .or(`title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s}`);
+      if (error) throw error;
+      const counts = new Map();
+      (data || []).forEach(r => { const k = r.sender || 'Unknown'; counts.set(k, (counts.get(k) || 0) + 1); });
+      const lines = Array.from(counts.entries()).sort((a,b) => b[1]-a[1]).slice(0,10).map(([k,v]) => `• ${k}: ${v}`);
+      send('delta', `Top senders:\n${lines.join('\n')}`);
+      send('end', { done: true, citations: [] });
+      return;
+    }
+
+    // Metadata short-circuit: if asking for a specific metadata field about the focus doc
+    const metaAsk = (() => {
+      const m = qLower;
+      const wantsSubject = /\b(subject|subj)\b/.test(m);
+      const wantsSummary = /\bsummary|summarize|overview\b/.test(m);
+      const wantsSender = /\b(sender|from)\b/.test(m);
+      const wantsReceiver = /\b(receiver|to)\b/.test(m);
+      const wantsDate = /\b(date|document date)\b/.test(m);
+      const wantsFilename = /\b(file(name)?|filename)\b/.test(m);
+      const wantsCategory = /\bcategory\b/.test(m);
+      const wantsTags = /\btags?\b/.test(m);
+      return { wantsSubject, wantsSummary, wantsSender, wantsReceiver, wantsDate, wantsFilename, wantsCategory, wantsTags };
+    })();
+
+    function canon(v) {
+      const s = String(v || '').trim();
+      const map = new Map([
+        ['maharashtra state electricity distribution co. ltd.', 'MAHAVITARAN (MSEDCL)'],
+        ['mseb', 'Maharashtra State Electricity Board (MSEB)'],
+        ['mahadiscom', 'MAHAVITARAN (MSEDCL)'],
+        ['m/s bhagyalaxmi steel alloy pvt.ltd.', 'M/S BHAGYALAXMI STEEL ALLOY PVT. LTD.'],
+      ]);
+      const key = s.toLowerCase();
+      return map.get(key) || s;
+    }
+
+    // Ordinal-aware metadata answers
+    function ordinalFromQuestion(txt) {
+      const t = txt.toLowerCase();
+      const map = new Map([
+        ['first', 1], ['1st', 1], ['#1', 1],
+        ['second', 2], ['2nd', 2], ['#2', 2],
+        ['third', 3], ['3rd', 3], ['#3', 3],
+        ['fourth', 4], ['4th', 4], ['#4', 4],
+        ['fifth', 5], ['5th', 5], ['#5', 5],
+      ]);
+      for (const [k, v] of map.entries()) if (t.includes(k)) return v;
+      return null;
+    }
+    function lastAssistantCitations(conv) {
+      for (let i = conv.length - 1; i >= 0; i--) {
+        const m = conv[i];
+        if (m?.role === 'assistant' && Array.isArray(m.citations) && m.citations.length > 0) return m.citations;
+      }
+      return [];
+    }
+    if (metaAsk.wantsSubject || metaAsk.wantsSummary || metaAsk.wantsSender || metaAsk.wantsReceiver || metaAsk.wantsDate || metaAsk.wantsFilename || metaAsk.wantsCategory || metaAsk.wantsTags) {
+      let targetId = focusDocId || null;
+      const ord = ordinalFromQuestion(question);
+      if (ord) {
+        const cites = lastAssistantCitations(conversation);
+        if (cites && cites.length >= ord) {
+          const id = cites[ord - 1]?.docId;
+          if (id) targetId = id;
+        }
+      }
+      if (targetId) {
+        send('stage', { agent: 'MetadataAgent', step: 'loading' });
+        const { data: doc } = await db
+          .from('documents')
+          .select('title, filename, subject, sender, receiver, document_date, category, tags')
+          .eq('org_id', orgId)
+          .eq('id', targetId)
+          .maybeSingle();
+        const lines = [];
+        if (metaAsk.wantsSubject) lines.push(`Subject: ${doc?.subject || '—'}`);
+        if (metaAsk.wantsSender) lines.push(`Sender: ${doc?.sender ? canon(doc.sender) : '—'}`);
+        if (metaAsk.wantsReceiver) lines.push(`Receiver: ${doc?.receiver ? canon(doc.receiver) : '—'}`);
+        if (metaAsk.wantsDate) lines.push(`Date: ${doc?.document_date || '—'}`);
+        if (metaAsk.wantsFilename) lines.push(`Filename: ${doc?.filename || doc?.title || '—'}`);
+        if (metaAsk.wantsCategory) lines.push(`Category: ${doc?.category || '—'}`);
+        if (metaAsk.wantsTags) lines.push(`Tags: ${(doc?.tags || []).join(', ') || '—'}`);
+
+        if (metaAsk.wantsSummary) {
+          // Prefer stored extraction summary, else generate from OCR text via Gemini and persist
+          send('stage', { agent: 'MetadataAgent', step: 'fetching_summary' });
+          let summaryText = '';
+          const ex = await loadExtraction(targetId);
+          if (ex?.metadata?.summary) summaryText = String(ex.metadata.summary);
+          else if ((ex?.ocrText || '').trim().length > 0) {
+            try {
+              const summarizePrompt = ai.definePrompt({
+                name: 'docSummaryMetadataOnly',
+                input: { schema: z.object({ text: z.string() }) },
+                output: { schema: z.object({ summary: z.string() }) },
+                prompt: `Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.\n\nText:\n{{text}}`,
+              });
+              const { output } = await summarizePrompt({ text: ex.ocrText.slice(0, 12000) });
+              summaryText = output?.summary || '';
+              // Persist for reuse
+              const merged = { ...ex, metadata: { ...(ex?.metadata || {}), summary: summaryText } };
+              await saveExtraction(targetId, merged);
+              send('stage', { agent: 'MetadataAgent', step: 'summary_generated' });
+            } catch {
+              // ignore generation errors, leave summary blank
+            }
+          }
+          if (summaryText) {
+            lines.unshift('Summary:');
+            lines.push(summaryText);
+          } else if (metaAsk.wantsSummary) {
+            lines.unshift('Summary: —');
+          }
+        }
+        if (lines.length) {
+          send('delta', lines.join('\n'));
+          send('end', { done: true, citations: [{ docId: targetId, page: null, snippet: '' }] });
+          return;
+        }
+      }
+    }
+
+    // Differences short-circuit: compare versions or two cited docs
+    if (primary === 'diff') {
+      async function getPrevVersion(doc) {
+        if (!doc.version_group_id) return null;
+        const { data: versions } = await db
+          .from('documents')
+          .select('id, title, filename, version_number, is_current_version')
+          .eq('org_id', orgId)
+          .eq('version_group_id', doc.version_group_id)
+          .order('version_number', { ascending: false })
+          .limit(2);
+        if (!versions || versions.length < 2) return null;
+        return { a: versions[0], b: versions[1] };
+      }
+      async function getDoc(id) {
+        const { data } = await db
+          .from('documents')
+          .select('id, title, filename, subject, sender, receiver, document_date, category, tags, version_group_id, version_number, is_current_version')
+          .eq('org_id', orgId)
+          .eq('id', id)
+          .maybeSingle();
+        return data || null;
+      }
+      async function loadExtraction(docId) {
+        try {
+          const { data, error } = await app.supabaseAdmin.storage.from('extractions').download(`${orgId}/${docId}.json`);
+          if (error || !data) return null;
+          const text = await data.text();
+          return JSON.parse(text);
+        } catch { return null; }
+      }
+      function diffFields(a, b) {
+        const out = [];
+        const f = (k, label, format) => {
+          const va = a?.[k] ?? null; const vb = b?.[k] ?? null;
+          const fa = format ? format(va) : va; const fb = format ? format(vb) : vb;
+          if (JSON.stringify(fa) !== JSON.stringify(fb)) out.push(`${label}: ${fa || '—'} → ${fb || '—'}`);
+        };
+        f('title', 'Title');
+        f('subject', 'Subject');
+        f('sender', 'Sender', canon);
+        f('receiver', 'Receiver', canon);
+        f('document_date', 'Date');
+        f('category', 'Category');
+        f('tags', 'Tags', (x) => Array.isArray(x) ? x.join(', ') : x);
+        return out;
+      }
+      function uniqueSnippets(pagesA, pagesB) {
+        try {
+          const take = (pages) => (Array.isArray(pages) ? pages.map(p => String(p.text||'')).join('\n') : '').split(/\n+/).map(s=>s.trim()).filter(s=>s.length>20);
+          const la = new Set(take(pagesA));
+          const lb = new Set(take(pagesB));
+          const onlyA = Array.from(la).filter(s => !lb.has(s)).slice(0, 2);
+          const onlyB = Array.from(lb).filter(s => !la.has(s)).slice(0, 2);
+          return { onlyA, onlyB };
+        } catch { return { onlyA: [], onlyB: [] }; }
+      }
+
+      // Determine docs to compare: two most recent citations or focus vs previous
+      const citedIds = [];
+      for (let i = conversation.length - 1; i >= 0; i--) {
+        const m = conversation[i]; if (m?.citations) m.citations.forEach(c => { if (c?.docId) citedIds.push(c.docId); });
+        if (citedIds.length >= 2) break;
+      }
+      if (citedIds.length < 2 && Array.isArray(lastListDocIds) && lastListDocIds.length >= 2) {
+        citedIds.push(lastListDocIds[0], lastListDocIds[1]);
+      }
+      let docA = null, docB = null;
+      if (citedIds.length >= 2) {
+        docA = await getDoc(citedIds[0]);
+        docB = await getDoc(citedIds[1]);
+      } else if (focusDocId) {
+        const d = await getDoc(focusDocId);
+        const pair = d ? await getPrevVersion(d) : null;
+        if (pair) { docA = await getDoc(pair.b.id); docB = await getDoc(pair.a.id); }
+      }
+      if (!docA || !docB) {
+        send('delta', 'I could not determine two documents to compare. Please cite two documents or view a document with versions.');
+        send('end', { done: true });
+        return;
+      }
+      const fieldDiffs = diffFields(docA, docB);
+      const extA = await loadExtraction(docA.id);
+      const extB = await loadExtraction(docB.id);
+      const pagesA = extA?.ocrPages || [];
+      const pagesB = extB?.ocrPages || [];
+      const { onlyA, onlyB } = uniqueSnippets(pagesA, pagesB);
+      const lines = [];
+      lines.push(`Comparing ${docA.title || docA.filename || 'Doc A'}${docA.version_number ? ` (v${docA.version_number})` : ''} → ${docB.title || docB.filename || 'Doc B'}${docB.version_number ? ` (v${docB.version_number})` : ''}`);
+      if (fieldDiffs.length) {
+        lines.push('Field differences:');
+        fieldDiffs.slice(0, 8).forEach(d => lines.push(`• ${d}`));
+      } else {
+        lines.push('No metadata field changes detected.');
+      }
+      if (onlyA.length || onlyB.length) {
+        lines.push('Content differences (unique lines):');
+        if (onlyA[0]) lines.push(`• Removed/changed: ${onlyA[0]}`);
+        if (onlyB[0]) lines.push(`• Added/changed: ${onlyB[0]}`);
+      }
+      send('delta', lines.join('\n'));
+      // Try to attach page-aware citations for the first differing lines
+      const cite = [];
+      function findPage(pages, snippet) {
+        if (!Array.isArray(pages) || !snippet) return null;
+        const idx = pages.findIndex(p => String(p.text||'').includes(snippet));
+        if (idx >= 0) return pages[idx].page || (idx+1);
+        return null;
+      }
+      if (onlyA[0]) cite.push({ docId: docA.id, page: findPage(pagesA, onlyA[0]), snippet: onlyA[0].slice(0, 300) });
+      if (onlyB[0]) cite.push({ docId: docB.id, page: findPage(pagesB, onlyB[0]), snippet: onlyB[0].slice(0, 300) });
+      send('end', { done: true, citations: cite });
+      return;
+    }
+
+    // Snippets mode — vector/lexical retrieval and LLM answer (fallback also runs when content was intended)
+    if (!allowSnippets) {
+      send('delta', 'Chat snippets are disabled for your role.');
+      send('end', { done: true });
+      return;
+    }
+
+    // Embed query if allowed; else lexical fallback
+    async function embedQuery(text) {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) return null;
+      const res = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data?.data?.[0]?.embedding || null;
+    }
+
+    const embedding = allowSemantic ? await embedQuery(question).catch(() => null) : null;
+    send('stage', { retrieval: embedding ? 'semantic' : 'lexical' });
+
+    let chunks = [];
+    if (embedding) {
+      const { data, error } = await db.rpc('match_doc_chunks', {
+        p_org_id: orgId,
+        p_query_embedding: embedding,
+        p_match_count: 24,
+        p_similarity_threshold: 0
+      });
+      if (error) req.log.warn(error, 'match_doc_chunks failed');
+      chunks = Array.isArray(data) ? data : [];
+    }
+    if (!embedding || chunks.length === 0) {
+      const s = `%${question.trim()}%`;
+      const { data, error } = await db
+        .from('documents')
+        .select('id, title, filename, subject, sender, receiver, uploaded_at, type, category, document_date')
+        .eq('org_id', orgId)
+        .or(`title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},type.ilike.${s},category.ilike.${s}`)
+        .order('uploaded_at', { ascending: false })
+        .limit(12);
+      if (!error) {
+        chunks = (data || []).map(d => ({
+          doc_id: d.id,
+          content: [d.title, d.subject, d.sender, d.receiver, d.type, d.category, d.document_date].filter(Boolean).join(' — ').slice(0, 500),
+          similarity: 0.3,
+          title: d.title || d.filename || 'Untitled',
+          filename: d.filename,
+          doc_type: d.type || null,
+          uploaded_at: d.uploaded_at
+        }));
+      }
+    }
+
+    // Aggregate by document and select top snippets
+    const byDoc = new Map();
+    for (const r of chunks) {
+      const id = r.doc_id;
+      const entry = byDoc.get(id) || { id, title: r.title || r.filename || 'Untitled', best: -1, snippets: [] };
+      entry.best = Math.max(entry.best, Number(r.similarity || 0));
+      if (entry.snippets.length < 3) entry.snippets.push(String(r.content || '').slice(0, 500));
+      byDoc.set(id, entry);
+    }
+    const docs = Array.from(byDoc.values()).sort((a,b) => b.best - a.best).slice(0, 10);
+
+    // If no retrieval context and the query looks like a directory ask (bills/notices/etc.),
+    // fall back to a quick metadata listing even if metadata mode wasn't selected.
+    if (docs.length === 0 && /(\bbills?\b|\binvoices?\b|\bnotices?\b|\bletters?\b|\bcirculars?\b)/i.test(question)) {
+      const s = `%${question.trim()}%`;
+      const { data } = await db
+        .from('documents')
+        .select('id, title, filename, sender, document_date, type, category')
+        .eq('org_id', orgId)
+        .or(`title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},type.ilike.${s},category.ilike.${s}`)
+        .order('uploaded_at', { ascending: false })
+        .limit(20);
+      const rows = data || [];
+      if (rows.length > 0) {
+        const name = (d) => d.title || d.filename || 'Untitled';
+        const lines = [];
+        lines.push(`Found ${rows.length} matching documents:`);
+        rows.slice(0, 8).forEach(d => {
+          const bits = [name(d)];
+          if (d.document_date) bits.push(d.document_date);
+          if (d.sender) bits.push(d.sender);
+          if (d.type) bits.push(d.type);
+          lines.push('• ' + bits.join(' · '));
+        });
+        if (rows.length > 8) lines.push(`• ... and ${rows.length - 8} more`);
+        send('delta', lines.join('\n'));
+        const cites = rows.slice(0, 3).map(d => ({ docId: d.id, page: null, snippet: '', docName: name(d) }));
+        send('end', { done: true, citations: cites });
+        return;
+      }
+    }
+
+    // Build prompt input; include gentle instruction to prefer subject fields if asked. Include short conversation for pronouns.
+    const contextBlocks = docs.map((d, i) => `[#${i}] ${d.title}\n${d.snippets.join('\n---\n')}`).join('\n\n');
+
+    // Use server AI (Gemini via Genkit) to generate answer
+    const { ai } = await import('./ai.js');
+    const prompt = ai.definePrompt({
+      name: 'serverAnswerPrompt',
+      input: { schema: z.object({ q: z.string(), ctx: z.string(), history: z.array(z.object({ role: z.string(), content: z.string() })).optional() }) },
+      output: { schema: z.object({ answer: z.string() }) },
+      prompt: `Answer the user's question using ONLY the provided context.\nIf unclear, ask a short clarifying question. Keep it concise.\nIf asked for subject/keywords, prefer explicit metadata (e.g., Subject) from the context over inference.\nUse history to resolve pronouns like it/this/that.\n\nQuestion: {{{q}}}\n\nHistory:\n{{#each history}}- {{role}}: {{{content}}}\n{{/each}}\n\nContext:\n{{{ctx}}}`,
+    });
+
+    let answerText = '';
+    try {
+      const shortHist = (conversation || []).slice(-4).map(m => ({ role: m.role || 'user', content: m.content || '' }));
+      const { output } = await prompt({ q: question, ctx: contextBlocks, history: shortHist });
+      answerText = output?.answer || '';
+    } catch (e) {
+      req.log.warn(e, 'LLM answer failed');
+      answerText = `I found ${docs.length} relevant documents but couldn't draft an answer.`;
+    }
+
+    // Stream final answer (simple one-chunk stream)
+    send('delta', answerText);
+
+    // Page-aware citations: pick the best chunk per doc and carry page when available
+    const topByDoc = new Map();
+    for (const r of chunks) {
+      const id = r.doc_id;
+      const score = Number(r.similarity || 0);
+      const prev = topByDoc.get(id);
+      if (!prev || score > prev.score) topByDoc.set(id, { score, page: (typeof r.page === 'number' ? r.page : null), snippet: String(r.content || '').slice(0, 500) });
+    }
+    const citations = Array.from(byDoc.values()).slice(0, 3).map((d) => {
+      const best = topByDoc.get(d.id);
+      return { docId: d.id, page: best?.page ?? null, snippet: best?.snippet || (d.snippets[0] || ''), docName: d.title };
+    });
+    send('end', { done: true, citations });
+
+    // No chat persistence or audit logging per requirements
   });
 
   app.post('/orgs/:orgId/chat/sessions', { preHandler: app.verifyAuth }, async (req) => {
@@ -2051,51 +4568,162 @@ Document: {{media url=dataUri}}`,
     return data;
   });
 
-  // Dashboard stats - admin/manager only
+  // Dashboard stats - role and department-based access
   app.get('/orgs/:orgId/dashboard/stats', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
     const role = await getUserOrgRole(req);
-    if (!role || !['orgAdmin', 'contentManager'].includes(role)) {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
+    
+    // Check user's role and department access
+    const { data: userRole } = await db
+      .from('organization_users')
+      .select('role')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .single();
+    
+    const isOrgAdmin = userRole?.role === 'orgAdmin';
+    
+    // Get user's departments for non-admin users
+    let userDepartments = [];
+    if (!isOrgAdmin) {
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      userDepartments = userDepts?.map(d => d.department_id) || [];
     }
 
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-    // Document stats
-    const { data: docStats, error: docErr } = await db
+    // Document stats - filter by department for non-admins
+    let docQuery = db
       .from('documents')
-      .select('id, file_size_bytes, type, uploaded_at, owner_user_id')
+      .select('id, file_size_bytes, type, uploaded_at, owner_user_id, department_id')
       .eq('org_id', orgId);
+
+    if (!isOrgAdmin) {
+      if (userDepartments.length > 0) {
+        // User has departments - include docs in their departments OR unassigned docs
+        docQuery = docQuery.or(`department_id.in.(${userDepartments.join(',')}),department_id.is.null`);
+      } else {
+        // User has no departments - only unassigned docs
+        docQuery = docQuery.is('department_id', null);
+      }
+    }
+
+    const { data: docStats, error: docErr } = await docQuery;
     if (docErr) throw docErr;
 
-    // User stats
-    const { data: userStats, error: userErr } = await db
-      .from('organization_users')
-      .select('user_id, role, expires_at')
-      .eq('org_id', orgId);
-    if (userErr) throw userErr;
+    // User stats - for admins show all, for others show department-specific
+    let userStatsData;
+    if (isOrgAdmin) {
+      const { data: userStats, error: userErr } = await db
+        .from('organization_users')
+        .select('user_id, role, expires_at')
+        .eq('org_id', orgId);
+      if (userErr) throw userErr;
+      userStatsData = userStats;
+    } else {
+      // For non-admins, show stats about users in their departments
+      if (userDepartments.length > 0) {
+        // Get user IDs from department_users first
+        const { data: deptUserIds, error: deptErr } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .in('department_id', userDepartments);
+        
+        if (deptErr) throw deptErr;
+        
+        const userIds = deptUserIds?.map(du => du.user_id) || [];
+        
+        if (userIds.length > 0) {
+          // Then get their organization roles
+          const { data: orgUsers, error: orgErr } = await db
+            .from('organization_users')
+            .select('user_id, role, expires_at')
+            .eq('org_id', orgId)
+            .in('user_id', userIds);
+          
+          if (orgErr) throw orgErr;
+          userStatsData = orgUsers || [];
+        } else {
+          userStatsData = [];
+        }
+      } else {
+        userStatsData = [];
+      }
+    }
 
     // Recent activity (last 7 days)
-    const { data: recentActivity, error: activityErr } = await db
-      .from('audit_events')
-      .select('*')
-      .eq('org_id', orgId)
-      .gte('ts', sevenDaysAgo.toISOString())
-      .order('ts', { ascending: false })
-      .limit(10);
-    if (activityErr) throw activityErr;
+    let recentActivity = [];
+    if (isOrgAdmin) {
+      const { data, error: activityErr } = await db
+        .from('audit_events')
+        .select('*')
+        .eq('org_id', orgId)
+        .gte('ts', sevenDaysAgo.toISOString())
+        .order('ts', { ascending: false })
+        .limit(10);
+      if (activityErr) throw activityErr;
+      recentActivity = data || [];
+    } else {
+      // Team-scoped activity only: doc-linked events for docs in user's departments, and login events for team users
+      // 1) Allowed doc IDs
+      let allowedDocIds = [];
+      if (userDepartments.length > 0) {
+        const { data: docIdsRows } = await db
+          .from('documents')
+          .select('id')
+          .eq('org_id', orgId)
+          .in('department_id', userDepartments);
+        allowedDocIds = (docIdsRows || []).map(r => r.id);
+      }
+      // 2) Team user IDs
+      const { data: teamUsers } = await db
+        .from('department_users')
+        .select('user_id')
+        .eq('org_id', orgId)
+        .in('department_id', userDepartments);
+      const teamUserIds = Array.from(new Set((teamUsers || []).map(r => r.user_id)));
 
-    // Chat sessions (last 30 days)
-    const { data: chatStats, error: chatErr } = await db
+      // 3) Fetch recent and filter client-side for clarity
+      const { data: rawActs, error: activityErr } = await db
+        .from('audit_events')
+        .select('*')
+        .eq('org_id', orgId)
+        .gte('ts', sevenDaysAgo.toISOString())
+        .order('ts', { ascending: false })
+        .limit(50);
+      if (activityErr) throw activityErr;
+      const list = rawActs || [];
+      const allowedDocsSet = new Set(allowedDocIds);
+      const allowedUsersSet = new Set(teamUserIds);
+      const filtered = list.filter(ev => {
+        if (ev.doc_id && allowedDocsSet.has(ev.doc_id)) return true;
+        if (ev.type === 'login' && ev.actor_user_id && allowedUsersSet.has(ev.actor_user_id)) return true;
+        return false;
+      });
+      recentActivity = filtered.slice(0, 10);
+    }
+
+    // Chat sessions (last 30 days) - admins see all, users see their own
+    let chatQuery = db
       .from('chat_sessions')
-      .select('id, created_at')
+      .select('id, created_at, user_id')
       .eq('org_id', orgId)
       .gte('created_at', thirtyDaysAgo.toISOString());
+
+    if (!isOrgAdmin) {
+      chatQuery = chatQuery.eq('user_id', userId);
+    }
+
+    const { data: chatStats, error: chatErr } = await chatQuery;
     if (chatErr) throw chatErr;
 
     // Process document stats
@@ -2110,12 +4738,12 @@ Document: {{media url=dataUri}}`,
     });
 
     // Process user stats
-    const totalMembers = userStats?.length || 0;
-    const activeMembers = (userStats || []).filter(u => !u.expires_at || new Date(u.expires_at) > now).length;
-    const tempUsers = (userStats || []).filter(u => u.expires_at && new Date(u.expires_at) > now).length;
+    const totalMembers = userStatsData?.length || 0;
+    const activeMembers = (userStatsData || []).filter(u => !u.expires_at || new Date(u.expires_at) > now).length;
+    const tempUsers = (userStatsData || []).filter(u => u.expires_at && new Date(u.expires_at) > now).length;
     
     const roleBreakdown = {};
-    (userStats || []).forEach(user => {
+    (userStatsData || []).forEach(user => {
       const role = user.role || 'Unknown';
       roleBreakdown[role] = (roleBreakdown[role] || 0) + 1;
     });

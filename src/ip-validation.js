@@ -32,9 +32,9 @@ function getClientIp(request) {
     }
   }
 
-  // Fallback to connection remote address
-  return request.connection?.remoteAddress || 
-         request.socket?.remoteAddress || 
+  // Prefer modern socket API; keep legacy fallbacks
+  return request.socket?.remoteAddress || 
+         request.connection?.remoteAddress || 
          request.connection?.socket?.remoteAddress ||
          request.ip ||
          'unknown';
@@ -52,7 +52,7 @@ function isIpInRange(ip, allowedIp) {
 /**
  * Validate IP against organization allowlist
  */
-async function validateIpAccess(app, orgId, clientIp, userRole = null) {
+async function validateIpAccess(app, orgId, clientIp, userRole = null, hasBypass = false) {
   try {
     // Fetch organization IP settings
     const { data: orgSettings, error } = await app.supabaseAdmin
@@ -72,8 +72,8 @@ async function validateIpAccess(app, orgId, clientIp, userRole = null) {
       return { allowed: true, reason: 'allowlist_disabled' };
     }
 
-    // Admin bypass: orgAdmin users can bypass IP restrictions
-    if (userRole === 'orgAdmin') {
+    // Bypass: users with security.ip_bypass (or legacy admin role)
+    if (hasBypass || userRole === 'orgAdmin') {
       return { allowed: true, reason: 'admin_bypass' };
     }
 
@@ -120,18 +120,29 @@ async function ipValidationPluginImpl(app, options) {
       // Get client IP
       const clientIp = getClientIp(request);
       
-      // Get user's role in this organization
+      // Get user's role, then fetch role permissions
       const { data: membership } = await request.supabase
         .from('organization_users')
-        .select('role')
+        .select('role, expires_at')
         .eq('org_id', orgId)
         .eq('user_id', request.user.sub)
         .maybeSingle();
 
       const userRole = membership?.role;
+      let hasBypass = false;
+      if (userRole) {
+        const { data: roleRow } = await request.supabase
+          .from('org_roles')
+          .select('permissions')
+          .eq('org_id', orgId)
+          .eq('key', userRole)
+          .maybeSingle();
+        const perms = roleRow?.permissions || {};
+        hasBypass = !!perms['security.ip_bypass'];
+      }
 
       // Validate IP access
-      const validation = await validateIpAccess(app, orgId, clientIp, userRole);
+      const validation = await validateIpAccess(app, orgId, clientIp, userRole, hasBypass);
 
       // Log the validation attempt
       app.log.info({
@@ -140,7 +151,8 @@ async function ipValidationPluginImpl(app, options) {
         clientIp,
         allowed: validation.allowed,
         reason: validation.reason,
-        userRole
+        userRole,
+        hasBypass
       }, 'IP validation check');
 
       // Block if not allowed
