@@ -3308,8 +3308,8 @@ Document: {{media url=dataUri}}`,
   app.post('/orgs/:orgId/uploads/direct', { preHandler: app.verifyAuth }, async (req, reply) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins can upload files
-    await ensureRole(req, ['orgAdmin','contentManager']);
+    // Only editors/admins/team leads can upload files
+    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
     const parts = req.parts();
     let filePart = null;
     for await (const part of parts) {
@@ -3330,8 +3330,8 @@ Document: {{media url=dataUri}}`,
 
   app.post('/orgs/:orgId/uploads/sign', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins can obtain signed upload URLs
-    await ensureRole(req, ['orgAdmin','contentManager']);
+    // Only editors/admins/team leads can obtain signed upload URLs
+    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
     const Schema = z.object({ filename: z.string(), mimeType: z.string().optional(), contentHash: z.string().optional() });
     const body = Schema.parse(req.body);
     const key = `${orgId}/${Date.now()}-${sanitizeFilename(body.filename)}`;
