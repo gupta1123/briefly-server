@@ -809,6 +809,7 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const role = await getUserOrgRole(req);
+    const withCounts = String(req.query?.withCounts || '0') !== '0';
     if (role === 'orgAdmin') {
       const { data, error } = await db
         .from('departments')
@@ -816,7 +817,24 @@ export function registerRoutes(app) {
         .eq('org_id', orgId)
         .order('name');
       if (error) throw error;
-      return data || [];
+      const list = data || [];
+      if (withCounts && list.length > 0) {
+        const { data: counts, error: countError } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId);
+        if (countError) throw countError;
+
+        // Count members per department manually to avoid aggregation issues
+        const countMap = new Map();
+        (counts || []).forEach(row => {
+          const deptId = row.department_id;
+          countMap.set(deptId, (countMap.get(deptId) || 0) + 1);
+        });
+
+        return list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+      }
+      return list;
     }
     const userId = req.user?.sub;
     const { data: mems, error: memErr } = await db
@@ -834,7 +852,25 @@ export function registerRoutes(app) {
       .in('id', ids)
       .order('name');
     if (error) throw error;
-    return data || [];
+    const list = data || [];
+    if (withCounts && list.length > 0) {
+      const { data: counts, error: countError } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .in('department_id', ids);
+      if (countError) throw countError;
+
+      // Count members per department manually to avoid aggregation issues
+      const countMap = new Map();
+      (counts || []).forEach(row => {
+        const deptId = row.department_id;
+        countMap.set(deptId, (countMap.get(deptId) || 0) + 1);
+      });
+
+      return list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+    }
+    return list;
   });
 
   app.post('/orgs/:orgId/departments', { preHandler: app.verifyAuth }, async (req) => {
@@ -902,11 +938,16 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/departments/:deptId/users', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only orgAdmin or department lead can view the member list
+    // Only orgAdmin, teamLead (with proper dept access), or department lead can view the member list
     const role = await getUserOrgRole(req);
-    if (role !== 'orgAdmin') {
+    const isOrgAdmin = role === 'orgAdmin';
+    const isTeamLead = role === 'teamLead';
+    
+    if (!isOrgAdmin) {
       const { deptId } = req.params;
       const userId = req.user?.sub;
+      
+      // Check if user is a department lead for this specific department
       const { data: lead } = await db
         .from('department_users')
         .select('user_id')
@@ -915,7 +956,30 @@ export function registerRoutes(app) {
         .eq('user_id', userId)
         .eq('role', 'lead')
         .maybeSingle();
-      if (!lead) { const e = new Error('Forbidden'); e.statusCode = 403; throw e; }
+        
+      // For teamLead org role: they can access any department they are a member of (lead or member)
+      if (isTeamLead) {
+        const { data: membership } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('department_id', deptId)
+          .eq('user_id', userId)
+          .maybeSingle();
+          
+        if (!membership) {
+          const e = new Error('Team leads can only access departments they are members of'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      } else {
+        // For non-teamLead roles, they must be a department lead
+        if (!lead) { 
+          const e = new Error('Forbidden'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      }
     }
     const { deptId } = req.params;
     const { data, error } = await db
@@ -956,6 +1020,8 @@ export function registerRoutes(app) {
     const callerId = req.user?.sub;
     const callerOrgRole = await getUserOrgRole(req);
     const isAdmin = callerOrgRole === 'orgAdmin';
+    const isTeamLead = callerOrgRole === 'teamLead';
+    
     // Non-admins must be department lead of this dept
     if (!isAdmin) {
       const { data: lead } = await db
@@ -966,12 +1032,37 @@ export function registerRoutes(app) {
         .eq('user_id', callerId)
         .eq('role', 'lead')
         .maybeSingle();
-      if (!lead) { const e = new Error('Forbidden'); e.statusCode = 403; throw e; }
+        
+      // For teamLead org role: they can manage any department they are a member of
+      if (isTeamLead) {
+        const { data: membership } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('department_id', deptId)
+          .eq('user_id', callerId)
+          .maybeSingle();
+          
+        if (!membership) {
+          const e = new Error('Team leads can only manage departments they are members of'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      } else {
+        // For non-teamLead roles, they must be a department lead
+        if (!lead) { 
+          const e = new Error('Forbidden'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      }
+      
       // Team lead cannot change their own role
       if (body.userId === callerId) {
         const e = new Error('Team leads cannot change their own role'); e.statusCode = 403; throw e;
       }
-      // Team lead cannot assign lead role to others
+      
+      // Team lead cannot assign lead role to others (only admins can)
       if (body.role === 'lead') {
         const e = new Error('Only admins can assign Team Lead role'); e.statusCode = 403; throw e;
       }
@@ -990,6 +1081,54 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { deptId, userId } = req.params;
+    const callerId = req.user?.sub;
+    const callerOrgRole = await getUserOrgRole(req);
+    const isAdmin = callerOrgRole === 'orgAdmin';
+    const isTeamLead = callerOrgRole === 'teamLead';
+    
+    // Non-admins must be department lead of this dept
+    if (!isAdmin) {
+      const { data: lead } = await db
+        .from('department_users')
+        .select('user_id')
+        .eq('org_id', orgId)
+        .eq('department_id', deptId)
+        .eq('user_id', callerId)
+        .eq('role', 'lead')
+        .maybeSingle();
+        
+      // For teamLead org role: they can manage any department they are a member of
+      if (isTeamLead) {
+        const { data: membership } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('department_id', deptId)
+          .eq('user_id', callerId)
+          .maybeSingle();
+          
+        if (!membership) {
+          const e = new Error('Team leads can only manage departments they are members of'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      } else {
+        // For non-teamLead roles, they must be a department lead
+        if (!lead) { 
+          const e = new Error('Forbidden'); 
+          e.statusCode = 403; 
+          throw e; 
+        }
+      }
+      
+      // Team lead cannot remove themselves
+      if (userId === callerId) {
+        const e = new Error('Team leads cannot remove themselves from the department'); 
+        e.statusCode = 403; 
+        throw e;
+      }
+    }
+    
     const { error } = await db
       .from('department_users')
       .delete()
@@ -1365,13 +1504,13 @@ export function registerRoutes(app) {
         
         if (userDepts && userDepts.length > 0) {
           const deptIds = userDepts.map(d => d.department_id);
-          // Include documents in user's departments OR documents with no department
-          query = query.or(`department_id.in.(${deptIds.join(',')}),department_id.is.null`);
-          console.log('🔍 Filtering to user departments:', deptIds, 'plus unassigned docs');
+          // STRICT: Only documents in user's departments (NO null department access)
+          query = query.in('department_id', deptIds);
+          console.log('🔍 Filtering to user departments ONLY:', deptIds);
         } else {
-          // User has no department access - only unassigned documents
-          query = query.is('department_id', null);
-          console.log('🔍 User has no department access - only unassigned docs');
+          // User has no department access - NO documents visible
+          query = query.eq('department_id', 'never-matches-anything');
+          console.log('🔍 User has no department access - no documents visible');
         }
       }
     } else {
@@ -1642,8 +1781,8 @@ export function registerRoutes(app) {
         }
       }
     } else {
-      // Admins: if not provided, allow null (RLS still allows via admin perms)
-      // Optionally default to General if present
+      // Admins: MUST specify a department - no more null department documents
+      // This prevents accidental leaking of admin-created content
       if (!departmentId) {
         try {
           const { data: general } = await db
@@ -1652,8 +1791,23 @@ export function registerRoutes(app) {
             .eq('org_id', orgId)
             .eq('name', 'General')
             .maybeSingle();
-          if (general?.id) departmentId = general.id;
-        } catch {}
+          if (general?.id) {
+            departmentId = general.id;
+          } else {
+            // If no General department exists, create one for admin content
+            const { data: newGeneral } = await db
+              .from('departments')
+              .insert({ org_id: orgId, name: 'General' })
+              .select('id')
+              .single();
+            departmentId = newGeneral.id;
+          }
+        } catch (error) {
+          // Fallback: require explicit department selection
+          const err = new Error('Please specify a department for this document');
+          err.statusCode = 400; 
+          throw err;
+        }
       }
     }
     console.log('Backend document creation - body.folderPath:', body.folderPath, 'Type:', typeof body.folderPath, 'Is Array:', Array.isArray(body.folderPath));
@@ -2466,17 +2620,47 @@ export function registerRoutes(app) {
     // Ensure the folder_path is properly formatted as an array for PostgreSQL
     // Resolve department for the folder placeholder
     let departmentId = bodyDept || null;
-    // If not provided, and user has exactly one department membership, use it
+    
+    // Check if user is admin
+    let isAdmin = false;
+    try { 
+      await ensurePerm(req, 'org.manage_members'); 
+      isAdmin = true; 
+    } catch { 
+      isAdmin = false; 
+    }
+    
+    // If not provided, determine user's department
     if (!departmentId) {
       try {
         const { data: myDepts } = await db
           .from('department_users')
-          .select('department_id')
+          .select('department_id, role')
           .eq('org_id', orgId)
           .eq('user_id', userId);
-        const uniq = Array.from(new Set((myDepts || []).map(r => r.department_id)));
-        if (uniq.length === 1) departmentId = uniq[0];
-      } catch {}
+        
+        console.log(`Folder creation: User ${userId} departments:`, myDepts);
+        
+        if (!isAdmin && (!myDepts || myDepts.length === 0)) {
+          const err = new Error('You must be a member of a department to create folders');
+          err.statusCode = 403; 
+          throw err;
+        }
+        
+        if (myDepts && myDepts.length > 0) {
+          // For non-admins: use their primary department (prefer lead role, then any)
+          const leadDept = myDepts.find(d => d.role === 'lead');
+          departmentId = leadDept ? leadDept.department_id : myDepts[0].department_id;
+          console.log(`Folder creation: Selected department ${departmentId} for user ${userId}`);
+        } else if (isAdmin) {
+          console.log(`Folder creation: Admin ${userId} has no department memberships, will require explicit selection`);
+        }
+      } catch (e) {
+        console.error('Folder creation: Error fetching user departments:', e);
+        if (e?.statusCode) throw e;
+      }
+    } else {
+      console.log(`Folder creation: Explicit department provided: ${departmentId}`);
     }
     // If a department is provided but the user is not a member and not an admin, reject
     if (departmentId) {
@@ -2501,17 +2685,20 @@ export function registerRoutes(app) {
         if (e?.statusCode) throw e;
       }
     }
-    // Default to 'General' department when still null
+    
+    // Final check: ensure department is set
     if (!departmentId) {
-      try {
-        const { data: gen } = await db
-          .from('departments')
-          .select('id')
-          .eq('org_id', orgId)
-          .eq('name', 'General')
-          .maybeSingle();
-        if (gen?.id) departmentId = gen.id;
-      } catch {}
+      if (isAdmin) {
+        // Admins must explicitly specify a department - no auto-fallback to General
+        const err = new Error('Admins must specify a department when creating folders');
+        err.statusCode = 400; 
+        throw err;
+      } else {
+        // Non-admins should have had their department determined above
+        const err = new Error('Could not determine your department. Please contact an administrator.');
+        err.statusCode = 403; 
+        throw err;
+      }
     }
 
     const placeholderDoc = {
@@ -4566,6 +4753,22 @@ Document: {{media url=dataUri}}`,
     const { data, error } = await db.from('chat_messages').select('*').eq('org_id', orgId).eq('session_id', id).order('created_at', { ascending: true });
     if (error) throw error;
     return data;
+  });
+
+  // Get user's department memberships
+  app.get('/orgs/:orgId/user/departments', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    
+    const { data, error } = await db
+      .from('department_users')
+      .select('department_id, role')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+      
+    if (error) throw error;
+    return data || [];
   });
 
   // Dashboard stats - role and department-based access
