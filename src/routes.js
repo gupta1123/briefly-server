@@ -1941,8 +1941,8 @@ export function registerRoutes(app) {
   app.post('/orgs/:orgId/documents/:id/reingest', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins may reingest
-    await ensureRole(req, ['orgAdmin','contentManager']);
+    // Only editors/admins/team leads may reingest
+    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
     const { id } = req.params;
     const { data: doc, error } = await db
       .from('documents')
@@ -3253,8 +3253,8 @@ Document: {{media url=dataUri}}`,
   // Save extraction (OCR text + metadata) to Storage bucket 'extractions' as JSON
   app.post('/orgs/:orgId/documents/:id/extraction', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins can write extraction artifacts
-    await ensureRole(req, ['orgAdmin','contentManager']);
+    // Only editors/admins/team leads can write extraction artifacts
+    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
     const { id } = req.params;
     const Schema = z.object({ ocrText: z.string().optional(), metadata: z.record(z.any()).optional() });
     const body = Schema.parse(req.body || {});
