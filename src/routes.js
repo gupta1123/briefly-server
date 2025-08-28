@@ -228,6 +228,27 @@ function toPgArray(arr) {
   return '{' + arr.map(s => '"' + String(s).replace(/"/g, '\"') + '"').join(',') + '}';
 }
 
+// Lightweight in-memory cache for Supabase admin user lookups (reduce API calls)
+// Cache key: userId; value: { email, displayName, expiresAt }
+const ADMIN_USER_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const adminUserCache = new Map();
+
+async function getAdminUserCached(app, userId) {
+  try {
+    const now = Date.now();
+    const hit = adminUserCache.get(userId);
+    if (hit && hit.expiresAt > now) return hit;
+    const { data } = await app.supabaseAdmin.auth.admin.getUserById(userId);
+    const email = data?.user?.email || null;
+    const displayName = (data?.user?.user_metadata?.display_name) || (data?.user?.user_metadata?.full_name) || null;
+    const entry = { email, displayName, expiresAt: now + ADMIN_USER_CACHE_TTL_MS };
+    adminUserCache.set(userId, entry);
+    return entry;
+  } catch {
+    return { email: null, displayName: null, expiresAt: Date.now() + 60_000 };
+  }
+}
+
 export function registerRoutes(app) {
   app.get('/me', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
@@ -253,6 +274,134 @@ export function registerRoutes(app) {
       displayName: userResult.data?.display_name || null,
       orgs: list.map((r) => ({ orgId: r.org_id, role: r.role, name: r.organizations?.name, expiresAt: r.expires_at })),
     };
+  });
+
+  // Bootstrap: aggregate user, orgs, selected org, perms, settings, departments (+membership flags)
+  app.get('/me/bootstrap', { preHandler: app.verifyAuth }, async (req) => {
+    console.log('Bootstrap endpoint called for user:', req.user?.sub);
+    const db = req.supabase;
+    const userId = req.user?.sub;
+    // 1) user profile
+    const { data: userRow } = await db.from('app_users').select('*').eq('id', userId).maybeSingle();
+
+    // 2) org memberships + org names
+    const { data: orgRows, error: orgErr } = await db
+      .from('organization_users')
+      .select('org_id, role, expires_at, organizations(name)')
+      .eq('user_id', userId);
+    if (orgErr) throw orgErr;
+    const now = Date.now();
+    const orgs = (orgRows || []).filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now);
+
+    // 3) choose selected org id: header X-Org-Id (if active), else highest role
+    const hdrOrg = req.headers['x-org-id'] ? String(req.headers['x-org-id']) : null;
+    const roleOrder = { guest: 0, contentViewer: 1, member: 2, contentManager: 2, teamLead: 3, orgAdmin: 4 };
+    let selectedOrgId = null;
+    if (hdrOrg && orgs.some((o) => String(o.org_id) === hdrOrg)) selectedOrgId = hdrOrg;
+    else if (orgs.length > 0) {
+      const best = orgs.reduce((acc, r) => (roleOrder[r.role] > roleOrder[acc.role] ? r : acc), orgs[0]);
+      selectedOrgId = String(best.org_id);
+    }
+    if (!selectedOrgId) {
+      // No active orgs; return minimal bootstrap
+      return {
+        user: { id: userId, displayName: userRow?.display_name || null },
+        orgs: [],
+        selectedOrgId: null,
+        orgSettings: null,
+        userSettings: null,
+        permissions: {},
+        departments: [],
+      };
+    }
+
+    // 4) org settings
+    const { data: orgSettingsRow } = await db
+      .from('org_settings')
+      .select('*')
+      .eq('org_id', selectedOrgId)
+      .maybeSingle();
+    const orgSettings = orgSettingsRow || {
+      org_id: selectedOrgId,
+      date_format: 'd MMM yyyy',
+      accent_color: 'default',
+      dark_mode: false,
+      chat_filters_enabled: false,
+      ip_allowlist_enabled: false,
+      ip_allowlist_ips: [],
+      categories: ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'],
+    };
+
+    // 5) user settings (ensure exists)
+    let { data: userSettings } = await db
+      .from('user_settings')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (!userSettings) {
+      const defaults = {
+        user_id: userId,
+        date_format: 'd MMM yyyy',
+        accent_color: 'default',
+        dark_mode: false,
+        chat_filters_enabled: false,
+      };
+      try {
+        const { data: created } = await db
+          .from('user_settings')
+          .upsert(defaults, { onConflict: 'user_id' })
+          .select('*')
+          .single();
+        userSettings = created || defaults;
+      } catch {
+        userSettings = defaults;
+      }
+    }
+
+    // 6) my permissions for selected org
+    let permissions = {};
+    try {
+      const { data: permMap, error } = await db.rpc('get_my_permissions', { p_org_id: selectedOrgId });
+      if (!error && permMap) permissions = permMap;
+      else permissions = await getMyPermissions(req, selectedOrgId);
+    } catch {
+      permissions = await getMyPermissions(req, selectedOrgId);
+    }
+
+    // 7) departments with membership flags
+    const { data: depts, error: dErr } = await db
+      .from('departments')
+      .select('id, org_id, name, lead_user_id, color, created_at, updated_at')
+      .eq('org_id', selectedOrgId)
+      .order('name');
+    if (dErr) throw dErr;
+    const { data: myDU } = await db
+      .from('department_users')
+      .select('department_id, role')
+      .eq('org_id', selectedOrgId)
+      .eq('user_id', userId);
+    const memSet = new Set((myDU || []).map((r) => r.department_id));
+    const leadSet = new Set((myDU || []).filter((r) => r.role === 'lead').map((r) => r.department_id));
+    const departments = (depts || []).map((d) => ({ ...d, is_member: memSet.has(d.id), is_lead: leadSet.has(d.id) }));
+
+    const result = {
+      user: { id: userId, displayName: userRow?.display_name || null },
+      orgs: orgs.map((r) => ({ orgId: r.org_id, role: r.role, name: r.organizations?.name, expiresAt: r.expires_at })),
+      selectedOrgId,
+      orgSettings,
+      userSettings,
+      permissions,
+      departments,
+    };
+    console.log('Bootstrap endpoint returning data:', {
+      userId,
+      selectedOrgId,
+      orgCount: orgs.length,
+      departmentCount: departments.length,
+      hasUserSettings: !!userSettings,
+      hasOrgSettings: !!orgSettings
+    });
+    return result;
   });
 
   app.get('/orgs', { preHandler: app.verifyAuth }, async (req) => {
@@ -413,6 +562,42 @@ export function registerRoutes(app) {
           'chat.save_sessions': true,
           'audit.read': true,
         } },
+        { key: 'member', name: 'Member', is_system: true, permissions: {
+          'org.manage_members': false,
+          'org.update_settings': false,
+          'security.ip_bypass': false,
+          'documents.read': true,
+          'documents.create': true,
+          'documents.update': true,
+          'documents.delete': true,
+          'documents.move': true,
+          'documents.link': true,
+          'documents.version.manage': true,
+          'documents.bulk_delete': false,
+          'storage.upload': true,
+          'search.semantic': true,
+          'chat.save_sessions': false,
+          'audit.read': false,
+        } },
+        { key: 'teamLead', name: 'Team Lead', is_system: true, permissions: {
+          'org.manage_members': false,
+          'org.update_settings': false,
+          'security.ip_bypass': false,
+          'documents.read': true,
+          'documents.create': true,
+          'documents.update': true,
+          'documents.delete': true,
+          'documents.move': true,
+          'documents.link': true,
+          'documents.version.manage': true,
+          'documents.bulk_delete': false,
+          'storage.upload': true,
+          'search.semantic': true,
+          'chat.save_sessions': false,
+          'audit.read': true,
+          'departments.read': true,
+          'departments.manage_members': true,
+        } },
         { key: 'contentViewer', name: 'Content Viewer', is_system: true, permissions: {
           'org.manage_members': false,
           'org.update_settings': false,
@@ -506,12 +691,9 @@ export function registerRoutes(app) {
     for (const row of list) {
       const uid = row.user_id;
       if (uid && (!idToEmail.has(uid) || !idToMetaName.has(uid))) {
-        try {
-          const { data: u } = await app.supabaseAdmin.auth.admin.getUserById(uid);
-          if (u?.user?.email) idToEmail.set(uid, u.user.email);
-          const metaName = (u?.user?.user_metadata?.display_name) || (u?.user?.user_metadata?.full_name) || null;
-          if (metaName) idToMetaName.set(uid, metaName);
-        } catch {}
+        const u = await getAdminUserCached(app, uid);
+        if (u.email) idToEmail.set(uid, u.email);
+        if (u.displayName) idToMetaName.set(uid, u.displayName);
       }
     }
     // Fetch department memberships and department names/colors
@@ -810,6 +992,8 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const role = await getUserOrgRole(req);
     const withCounts = String(req.query?.withCounts || '0') !== '0';
+    const includeMine = String(req.query?.includeMine || '0') !== '0';
+    const callerId = req.user?.sub;
     if (role === 'orgAdmin') {
       const { data, error } = await db
         .from('departments')
@@ -817,7 +1001,7 @@ export function registerRoutes(app) {
         .eq('org_id', orgId)
         .order('name');
       if (error) throw error;
-      const list = data || [];
+      let list = data || [];
       if (withCounts && list.length > 0) {
         const { data: counts, error: countError } = await db
           .from('department_users')
@@ -832,7 +1016,17 @@ export function registerRoutes(app) {
           countMap.set(deptId, (countMap.get(deptId) || 0) + 1);
         });
 
-        return list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+        list = list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+      }
+      if (includeMine && list.length > 0) {
+        const { data: myDU } = await db
+          .from('department_users')
+          .select('department_id, role')
+          .eq('org_id', orgId)
+          .eq('user_id', callerId);
+        const memSet = new Set((myDU || []).map((r) => r.department_id));
+        const leadSet = new Set((myDU || []).filter((r) => r.role === 'lead').map((r) => r.department_id));
+        list = list.map((d) => ({ ...d, is_member: memSet.has(d.id), is_lead: leadSet.has(d.id) }));
       }
       return list;
     }
@@ -852,7 +1046,7 @@ export function registerRoutes(app) {
       .in('id', ids)
       .order('name');
     if (error) throw error;
-    const list = data || [];
+    let list = data || [];
     if (withCounts && list.length > 0) {
       const { data: counts, error: countError } = await db
         .from('department_users')
@@ -868,7 +1062,19 @@ export function registerRoutes(app) {
         countMap.set(deptId, (countMap.get(deptId) || 0) + 1);
       });
 
-      return list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+      list = list.map(d => ({ ...d, member_count: countMap.get(d.id) || 0 }));
+    }
+    if (includeMine && list.length > 0) {
+      const memSet = new Set(ids);
+      // caller is member of all in list; determine lead flags
+      const { data: myDU } = await db
+        .from('department_users')
+        .select('department_id, role')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .in('department_id', ids);
+      const leadSet = new Set((myDU || []).filter((r) => r.role === 'lead').map((r) => r.department_id));
+      list = list.map((d) => ({ ...d, is_member: memSet.has(d.id), is_lead: leadSet.has(d.id) }));
     }
     return list;
   });
@@ -995,12 +1201,9 @@ export function registerRoutes(app) {
     for (const r of rows) {
       const uid = r.user_id;
       if (uid && (!idToEmail.has(uid) || !idToMetaName.has(uid))) {
-        try {
-          const { data: u } = await app.supabaseAdmin.auth.admin.getUserById(uid);
-          if (u?.user?.email) idToEmail.set(uid, u.user.email);
-          const metaName = (u?.user?.user_metadata?.display_name) || (u?.user?.user_metadata?.full_name) || null;
-          if (metaName) idToMetaName.set(uid, metaName);
-        } catch {}
+        const u = await getAdminUserCached(app, uid);
+        if (u.email) idToEmail.set(uid, u.email);
+        if (u.displayName) idToMetaName.set(uid, u.displayName);
       }
     }
     return rows.map(r => ({
@@ -1447,13 +1650,13 @@ export function registerRoutes(app) {
   });
 
   app.get('/orgs/:orgId/documents', { preHandler: app.verifyAuth }, async (req) => {
+    console.log('Documents endpoint called for org:', req.params.orgId, 'user:', req.user?.sub, 'query:', req.query);
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { q, limit = 50, offset = 0, departmentId } = req.query || {};
     const userId = req.user?.sub;
     
-    console.log('🔍 Building documents query for org:', orgId, 'user:', userId);
-    console.log('🔍 Query params - q:', q, 'limit:', limit, 'offset:', offset, 'departmentId:', departmentId);
+    // Build documents query
     
     // First, check user's role and department memberships
     const { data: userRole } = await db
@@ -1464,11 +1667,11 @@ export function registerRoutes(app) {
       .single();
     
     const isOrgAdmin = userRole?.role === 'orgAdmin';
-    console.log('🔍 User role:', userRole?.role, 'isOrgAdmin:', isOrgAdmin);
+    // User role derived above
     
     let query = db
       .from('documents')
-      .select('*')
+      .select('id, org_id, title, filename, type, folder_path, subject, description, category, tags, keywords, sender, receiver, document_date, uploaded_at, file_size_bytes, mime_type, content_hash, storage_key, department_id, version_group_id, version_number, is_current_version, supersedes_id')
       .eq('org_id', orgId)
       .order('uploaded_at', { ascending: false })
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
@@ -1493,7 +1696,7 @@ export function registerRoutes(app) {
         }
         
         query = query.eq('department_id', departmentId);
-        console.log('🔍 Filtering to specific department:', departmentId);
+        // Specific department filter
       } else {
         // No specific department - get user's accessible departments
         const { data: userDepts } = await db
@@ -1506,35 +1709,25 @@ export function registerRoutes(app) {
           const deptIds = userDepts.map(d => d.department_id);
           // STRICT: Only documents in user's departments (NO null department access)
           query = query.in('department_id', deptIds);
-          console.log('🔍 Filtering to user departments ONLY:', deptIds);
+          // Limit to user's departments
         } else {
           // User has no department access - NO documents visible
           query = query.eq('department_id', 'never-matches-anything');
-          console.log('🔍 User has no department access - no documents visible');
+          // User has no accessible departments
         }
       }
     } else {
-      console.log('🔍 Org admin - can see all documents');
+      // Admin can see all documents
       if (departmentId) {
         query = query.eq('department_id', departmentId);
-        console.log('🔍 Admin filtering to specific department:', departmentId);
+        // Admin filtering to specific department
       }
     }
     
-    console.log('🔍 Query built with .neq("type", "folder")');
+    // Excluding folder placeholders
     
     // Debug: Let's see what's actually in the database
-    const { data: debugData, error: debugError } = await db
-      .from('documents')
-      .select('id, type, title')
-      .eq('org_id', orgId)
-      .limit(10);
-    
-    if (!debugError) {
-      console.log('🔍 DEBUG - Raw database contents (first 10):', debugData);
-      console.log('🔍 DEBUG - Types found:', debugData?.map(d => d.type));
-      console.log('🔍 DEBUG - Any folders?', debugData?.some(d => d.type === 'folder'));
-    }
+    // Remove heavy debug queries in production
     
     if (q && String(q).trim()) {
       const s = `%${String(q).trim()}%`;
@@ -1542,23 +1735,18 @@ export function registerRoutes(app) {
         `title.ilike.${s},subject.ilike.${s},sender.ilike.${s},receiver.ilike.${s},description.ilike.${s}`
       );
     }
-    console.log('🔍 Executing query...');
+    // Execute query
     const { data, error } = await query;
     if (error) {
-      console.error('❌ Query error:', error);
+      // Query error
       throw error;
     }
     
-    console.log('🔍 Raw query results - Total documents:', data?.length);
-    if (data && data.length > 0) {
-      console.log('🔍 Document types found:', data.map(d => ({ id: d.id, type: d.type, title: d.title })));
-      console.log('🔍 Any folders in results?', data.some(d => d.type === 'folder'));
-    }
+    // Map and filter results
     
     // Double-check: manually filter out any folders that might have slipped through
     const filteredData = data?.filter(d => d.type !== 'folder') || [];
-    console.log('🔍 After manual filtering - Total documents:', filteredData.length);
-    console.log('🔍 Manual filter removed:', (data?.length || 0) - filteredData.length, 'folder documents');
+    // Manual folder filter safeguard
     
     // Fetch linked documents for all documents
     const docIds = (filteredData || []).map(d => d.id);
@@ -1582,19 +1770,7 @@ export function registerRoutes(app) {
         }, {});
       }
 
-      // Also include incoming links (if any reverse rows are missing, this still captures them)
-      const { data: revLinks } = await db
-        .from('document_links')
-        .select('doc_id, linked_doc_id')
-        .eq('org_id', orgId)
-        .in('linked_doc_id', docIds);
-      if (revLinks) {
-        for (const link of revLinks) {
-          const targetId = link.linked_doc_id; // one of our docIds
-          const otherId = link.doc_id;
-          (linksMap[targetId] ||= []).push(otherId);
-        }
-      }
+      // Rely on outgoing links; if bidirectional linking is enforced, this suffices
 
       // Determine semantic readiness by checking if any chunk exists per doc
       const { data: chunkDocs } = await db
@@ -1669,8 +1845,8 @@ export function registerRoutes(app) {
       semanticReady: (chunksCountMap.get(d.id) || 0) > 0
     }));
     
-    console.log('🔍 Final result - Returning', mappedData.length, 'documents');
-    console.log('🔍 Final document types:', mappedData.map(d => d.type));
+    // Return final results
+    console.log('Documents endpoint returning', mappedData.length, 'documents for user:', userId, 'org:', orgId);
     return mappedData;
   });
 
@@ -1941,8 +2117,8 @@ export function registerRoutes(app) {
   app.post('/orgs/:orgId/documents/:id/reingest', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins/team leads may reingest
-    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
+    // Require edit permission (RLS on documents will scope to allowed docs)
+    await ensurePerm(req, 'documents.update');
     const { id } = req.params;
     const { data: doc, error } = await db
       .from('documents')
@@ -2967,7 +3143,6 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/folder-access', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
     const pathStr = String((req.query?.path || ''));
     const pathArr = pathStr ? pathStr.split('/').filter(Boolean) : [];
     const { data, error } = await db
@@ -2982,7 +3157,6 @@ export function registerRoutes(app) {
   app.put('/orgs/:orgId/folder-access', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
     // Admin or dept lead-permitted via RLS on folder_access
     const Schema = z.object({ path: z.array(z.string()), departmentIds: z.array(z.string().uuid()) });
     const { path, departmentIds } = Schema.parse(req.body || {});
@@ -3000,6 +3174,43 @@ export function registerRoutes(app) {
       .insert(rows);
     if (insErr) throw insErr;
     return { ok: true };
+  });
+
+  // Batch folder access lookup: accept multiple paths, return mapping
+  app.post('/orgs/:orgId/folder-access/batch', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const Schema = z.object({ paths: z.array(z.array(z.string())) });
+    const body = Schema.parse(req.body || {});
+    const paths = Array.from(new Set((body.paths || []).map((p) => (Array.isArray(p) ? p.filter(Boolean).join('/') : '')).filter(Boolean)));
+    if (paths.length === 0) return { results: {} };
+
+    // Build PostgREST OR clauses for text[] equality on path
+    const pathToArr = new Map(paths.map((s) => [s, s.split('/').filter(Boolean)]));
+    const chunks = [];
+    const arrLiterals = paths.map((s) => toPgArray(pathToArr.get(s)));
+    const results = {};
+    for (const p of paths) results[p] = [];
+
+    // Chunk OR conditions to avoid very long URLs
+    const BATCH = 25;
+    for (let i = 0; i < arrLiterals.length; i += BATCH) {
+      const slice = arrLiterals.slice(i, i + BATCH);
+      const orExpr = slice.map((lit) => `path.eq.${lit}`).join(',');
+      const { data, error } = await db
+        .from('folder_access')
+        .select('department_id, path')
+        .eq('org_id', orgId)
+        .or(orExpr);
+      if (error) throw error;
+      for (const row of data || []) {
+        const key = Array.isArray(row.path) ? row.path.join('/') : '';
+        if (!key) continue;
+        (results[key] ||= []);
+        if (!results[key].includes(row.department_id)) results[key].push(row.department_id);
+      }
+    }
+    return { results };
   });
 
   app.get('/orgs/:orgId/search', { preHandler: app.verifyAuth }, async (req) => {
@@ -3253,9 +3464,21 @@ Document: {{media url=dataUri}}`,
   // Save extraction (OCR text + metadata) to Storage bucket 'extractions' as JSON
   app.post('/orgs/:orgId/documents/:id/extraction', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins/team leads can write extraction artifacts
-    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
+    // Require edit permission (doc-level RLS will further restrict)
+    await ensurePerm(req, 'documents.update');
     const { id } = req.params;
+    // Ensure caller can see the document (RLS) before allowing extraction writes
+    try {
+      const { data: visible } = await req.supabase
+        .from('documents')
+        .select('id')
+        .eq('org_id', orgId)
+        .eq('id', id)
+        .maybeSingle();
+      if (!visible) {
+        return reply.code(404).send({ error: 'Not found' });
+      }
+    } catch {}
     const Schema = z.object({ ocrText: z.string().optional(), metadata: z.record(z.any()).optional() });
     const body = Schema.parse(req.body || {});
     const key = `${orgId}/${id}.json`;
@@ -3287,6 +3510,18 @@ Document: {{media url=dataUri}}`,
   app.get('/orgs/:orgId/documents/:id/extraction', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
+    // Verify caller can read the document via RLS before downloading extraction
+    try {
+      const { data: visible } = await req.supabase
+        .from('documents')
+        .select('id')
+        .eq('org_id', orgId)
+        .eq('id', id)
+        .maybeSingle();
+      if (!visible) {
+        return reply.code(404).send({ error: 'Not found' });
+      }
+    } catch {}
     const key = `${orgId}/${id}.json`;
     console.log('GET extraction - orgId:', orgId, 'documentId:', id, 'key:', key);
     const { data, error } = await app.supabaseAdmin.storage.from('extractions').download(key);
@@ -3308,8 +3543,8 @@ Document: {{media url=dataUri}}`,
   app.post('/orgs/:orgId/uploads/direct', { preHandler: app.verifyAuth }, async (req, reply) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins/team leads can upload files
-    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
+    // Require storage upload permission
+    await ensurePerm(req, 'storage.upload');
     const parts = req.parts();
     let filePart = null;
     for await (const part of parts) {
@@ -3330,8 +3565,8 @@ Document: {{media url=dataUri}}`,
 
   app.post('/orgs/:orgId/uploads/sign', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    // Only editors/admins/team leads can obtain signed upload URLs
-    await ensureRole(req, ['orgAdmin','contentManager','teamLead']);
+    // Require storage upload permission
+    await ensurePerm(req, 'storage.upload');
     const Schema = z.object({ filename: z.string(), mimeType: z.string().optional(), contentHash: z.string().optional() });
     const body = Schema.parse(req.body);
     const key = `${orgId}/${Date.now()}-${sanitizeFilename(body.filename)}`;
