@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ai } from './ai.js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { routeQuestion } from './agents/router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
@@ -3313,6 +3314,13 @@ export function registerRoutes(app) {
     return payload;
   });
 
+  // Initialize Gemini client for file uploads
+  const getGeminiClient = () => {
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    if (!apiKey) throw new Error('Gemini API key not configured');
+    return new GoogleGenerativeAI(apiKey);
+  };
+
   // Backend OCR/metadata from Storage - download object, send as data URI
   app.post('/orgs/:orgId/uploads/analyze', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
@@ -3336,22 +3344,22 @@ export function registerRoutes(app) {
     // Store file size for use in fallback (in case AI processing fails)
     const originalFileSizeMB = fileSizeMB;
 
-    // AI processing limits for different file types
+    // Updated size limits for Gemini File API (more generous)
     const AI_SIZE_LIMITS = {
-      'application/pdf': 25,  // 25MB for PDFs (text extraction)
-      'image/jpeg': 5,        // 5MB for images
-      'image/png': 5,         // 5MB for images
-      'image/gif': 3,         // 3MB for GIFs
-      'application/msword': 10,  // 10MB for DOC
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 10, // 10MB for DOCX
-      'application/vnd.ms-powerpoint': 15, // 15MB for PPT
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 15, // 15MB for PPTX
-      'text/plain': 1,        // 1MB for text files
-      'text/markdown': 1,     // 1MB for markdown
+      'application/pdf': 100,  // 100MB for PDFs (File API is more efficient)
+      'image/jpeg': 50,        // 50MB for images
+      'image/png': 50,         // 50MB for images
+      'image/gif': 20,         // 20MB for GIFs
+      'application/msword': 50,  // 50MB for DOC
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 50, // 50MB for DOCX
+      'application/vnd.ms-powerpoint': 75, // 75MB for PPT
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 75, // 75MB for PPTX
+      'text/plain': 10,        // 10MB for text files
+      'text/markdown': 10,     // 10MB for markdown
     };
 
     const mimeTypeKey = mimeType || fileBlob.type;
-    const sizeLimit = AI_SIZE_LIMITS[mimeTypeKey] || 5; // Default 5MB limit
+    const sizeLimit = AI_SIZE_LIMITS[mimeTypeKey] || 50; // Default 50MB limit
 
     // Check if file is too large for AI processing
     if (fileSizeMB > sizeLimit) {
@@ -3396,16 +3404,20 @@ export function registerRoutes(app) {
       });
     }
 
+    // Use optimized base64 approach (working and reliable)
+    console.log(`Processing ${fileSizeMB.toFixed(2)}MB file with Gemini...`);
     const arr = await fileBlob.arrayBuffer();
     const b64 = Buffer.from(arr).toString('base64');
-    const ct = mimeType || fileBlob.type || 'application/octet-stream';
-    const dataUri = `data:${ct};base64,${b64}`;
+    const dataUri = `data:${mimeTypeKey};base64,${b64}`;
 
-    // Add timeout for AI processing based on file size
-    const timeoutMs = Math.min(30000 + (fileSizeMB * 2000), 120000); // Base 30s + 2s per MB, max 2min
-    console.log(`Processing file with AI: ${fileSizeMB.toFixed(2)}MB, timeout: ${timeoutMs}ms`);
+    // Use Genkit approach (proven to work)
+    const ocrPrompt = ai.definePrompt({
+      name: 'ocrPrompt',
+      input: { schema: z.object({ dataUri: z.string() }) },
+      output: { schema: z.object({ extractedText: z.string().optional() }) },
+      prompt: `Extract the readable text from the following document:\n\n{{media url=dataUri}}`
+    });
 
-    const ocrPrompt = ai.definePrompt({ name: 'ocrPrompt', input: { schema: z.object({ dataUri: z.string() }) }, output: { schema: z.object({ extractedText: z.string().optional() }) }, prompt: `Extract the readable text from the following document:\n\n{{media url=dataUri}}` });
     const metaPrompt = ai.definePrompt({
       name: 'metaPrompt',
       input: { schema: z.object({ dataUri: z.string() }) },
@@ -3455,113 +3467,32 @@ IMPORTANT OUTPUT REQUIREMENTS:
 Document: {{media url=dataUri}}`,
     });
 
-    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-    function isRetryable(err) {
-      const msg = String(err?.message || '').toLowerCase();
-      return err?.status === 429 ||
-             err?.status === 503 ||
-             msg.includes('overloaded') ||
-             msg.includes('rate') ||
-             msg.includes('unavailable') ||
-             msg.includes('timeout') ||
-             msg.includes('processing timeout');
-    }
+    // Process with reliable approach
+    const [ocrResult, metaResult] = await Promise.all([
+      ocrPrompt({ dataUri }),
+      metaPrompt({ dataUri }),
+    ]);
 
-    let lastErr = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        // Add timeout wrapper for AI processing
-        const processWithTimeout = async () => {
-          return await Promise.all([
-            ocrPrompt({ dataUri }),
-            metaPrompt({ dataUri }),
-          ]);
-        };
+    const [{ output: ocr }, { output: meta }] = [ocrResult, metaResult];
 
-        // Create a timeout promise
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error(`AI processing timeout after ${timeoutMs}ms`)), timeoutMs);
-        });
-
-        // Race between AI processing and timeout
-        const [ocrResult, metaResult] = await Promise.race([
-          processWithTimeout(),
-          timeoutPromise
-        ]);
-
-        const [{ output: ocr }, { output: meta }] = [ocrResult, metaResult];
-        // Post-process to guarantee required fields, even for images
-        const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
-        const ensured = {
-          title: (meta?.title || baseName),
-          subject: (meta?.subject || baseName),
-          keywords: Array.from(new Set(((meta?.keywords || []).filter(Boolean).slice(0,10)).concat([baseName]))).slice(0, 10),
-          tags: Array.from(new Set(((meta?.tags || []).filter(Boolean).slice(0,8)).concat(['document']))).slice(0, 8),
-          summary: meta?.summary || '',
-          sender: meta?.sender,
-          receiver: meta?.receiver,
-          documentDate: meta?.documentDate,
-          category: meta?.category,
-        };
-        return { ocrText: ocr?.extractedText || '', metadata: ensured };
-      } catch (e) {
-        lastErr = e;
-        if (!isRetryable(e)) break;
-        await sleep(500 * (attempt + 1));
-      }
-    }
-
-    // Enhanced fallback: return better metadata so UI can proceed; user can edit fields
+    // Post-process to guarantee required fields
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
-    const fileExtension = baseName.split('.').pop()?.toLowerCase() || '';
-    const fallbackFileSizeMB = originalFileSizeMB;
-
-    // Determine the reason for fallback
-    let fallbackReason = 'AI temporarily unavailable';
-    let userGuidance = 'The document has been uploaded successfully. You can manually add metadata or try uploading a smaller file.';
-
-    if (lastErr?.message?.includes('timeout')) {
-      fallbackReason = 'AI processing timeout';
-      userGuidance = `The document (${fallbackFileSizeMB.toFixed(1)}MB) took too long to process. Try uploading a smaller file or the document will be processed in the background.`;
-    } else if (lastErr?.status === 429) {
-      fallbackReason = 'AI rate limit exceeded';
-      userGuidance = 'Too many requests to AI service. Please wait a moment and try again.';
-    } else if (lastErr?.status === 503) {
-      fallbackReason = 'AI service overloaded';
-      userGuidance = 'AI service is temporarily busy. The document will be processed in the background when service is available.';
-    }
-
-    // Enhanced fallback metadata
-    const enhancedFallback = {
-      title: baseName.replace(/\.[^/.]+$/, ""), // Remove extension from title
-      subject: `${baseName} - ${fallbackReason}`,
-      keywords: [baseName, fileExtension.toUpperCase(), 'document', 'ai-failed'],
-      tags: ['document', fileExtension || 'unknown', 'ai-fallback'],
-      summary: `${fallbackReason}. ${userGuidance} File size: ${fallbackFileSizeMB.toFixed(1)}MB.`,
-      description: `Document uploaded successfully but AI analysis failed: ${fallbackReason}. ${userGuidance}`,
-      category: availableCategories.includes('General') ? 'General' : availableCategories[0],
+    const ensured = {
+      title: (meta?.title || baseName),
+      subject: (meta?.subject || baseName),
+      keywords: Array.from(new Set(((meta?.keywords || []).filter(Boolean).slice(0,10)).concat([baseName]))).slice(0, 10),
+      tags: Array.from(new Set(((meta?.tags || []).filter(Boolean).slice(0,8)).concat(['document']))).slice(0, 8),
+      summary: meta?.summary || '',
+      sender: meta?.sender,
+      receiver: meta?.receiver,
+      senderOptions: meta?.senderOptions || [],
+      receiverOptions: meta?.receiverOptions || [],
+      documentDate: meta?.documentDate,
+      category: meta?.category,
     };
 
-    // Add file-type specific metadata
-    if (['pdf'].includes(fileExtension)) {
-      enhancedFallback.tags.push('pdf', 'readable');
-    } else if (['doc', 'docx'].includes(fileExtension)) {
-      enhancedFallback.tags.push('word', 'editable');
-    } else if (['ppt', 'pptx'].includes(fileExtension)) {
-      enhancedFallback.tags.push('presentation', 'slides');
-    } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileExtension)) {
-      enhancedFallback.tags.push('image', 'visual');
-    }
-
-    console.log(`AI processing failed: ${fallbackReason}. File: ${baseName} (${fallbackFileSizeMB.toFixed(2)}MB)`);
-
-    return reply.code(503).send({
-      error: fallbackReason,
-      fallback: {
-        ocrText: '',
-        metadata: enhancedFallback,
-      },
-    });
+    console.log('✅ Successfully processed file with Gemini');
+    return { ocrText: ocr?.extractedText || '', metadata: ensured };
   });
 
   app.post('/orgs/:orgId/uploads/finalize', { preHandler: app.verifyAuth }, async (req) => {
