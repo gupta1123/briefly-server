@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ai } from './ai.js';
 import { routeQuestion } from './agents/router.js';
 import { ingestDocument } from './ingest.js';
+import { registerAllRoutes } from './routes/index.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -418,103 +419,7 @@ export function registerRoutes(app) {
       .map((r) => ({ orgId: r.org_id, role: r.role, name: r.organizations?.name }));
   });
 
-  // User-scoped settings (preferences)
-  app.get('/me/settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
-    const userId = req.user?.sub;
-    const { data, error } = await db
-      .from('user_settings')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error && error.code !== 'PGRST116') throw error;
-    if (data) return data;
-    // Auto-create default row for new users to persist immediately
-    const defaults = {
-      user_id: userId,
-      date_format: 'd MMM yyyy',
-      accent_color: 'default',
-      dark_mode: false,
-      chat_filters_enabled: false,
-    };
-    try {
-      const { data: created } = await db
-        .from('user_settings')
-        .upsert(defaults, { onConflict: 'user_id' })
-        .select('*')
-        .single();
-      if (created) return created;
-    } catch {}
-    return defaults;
-  });
 
-  app.put('/me/settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
-    const userId = req.user?.sub;
-    const Schema = z.object({
-      date_format: z.string().min(1).optional(),
-      accent_color: z.string().min(1).optional(),
-      dark_mode: z.boolean().optional(),
-      chat_filters_enabled: z.boolean().optional(),
-    });
-    const body = Schema.parse(req.body || {});
-    const payload = { user_id: userId, ...body };
-    const { data, error } = await db
-      .from('user_settings')
-      .upsert(payload, { onConflict: 'user_id' })
-      .select('*')
-      .single();
-    if (error) throw error;
-    return data;
-  });
-
-  // Organization settings (persist UI and security preferences)
-  app.get('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
-    const orgId = await ensureActiveMember(req);
-    const { data, error } = await db
-      .from('org_settings')
-      .select('*')
-      .eq('org_id', orgId)
-      .maybeSingle();
-    if (error && error.code !== 'PGRST116') throw error;
-    return data || {
-      org_id: orgId,
-      date_format: 'd MMM yyyy',
-      accent_color: 'default',
-      dark_mode: false,
-      chat_filters_enabled: false,
-      ip_allowlist_enabled: false,
-      ip_allowlist_ips: [],
-      categories: ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'],
-    };
-  });
-
-  app.put('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
-    const orgId = await ensureActiveMember(req);
-    // Require permission to update org settings
-    await ensurePerm(req, 'org.update_settings');
-
-    const Schema = z.object({
-      date_format: z.string().min(1).optional(),
-      accent_color: z.string().min(1).optional(),
-      dark_mode: z.boolean().optional(),
-      chat_filters_enabled: z.boolean().optional(),
-      ip_allowlist_enabled: z.boolean().optional(),
-      ip_allowlist_ips: z.array(z.string()).optional(),
-      categories: z.array(z.string()).optional(),
-    });
-    const body = Schema.parse(req.body || {});
-    const payload = { org_id: orgId, ...body };
-    const { data, error } = await db
-      .from('org_settings')
-      .upsert(payload, { onConflict: 'org_id' })
-      .select('*')
-      .single();
-    if (error) throw error;
-    return data;
-  });
 
   app.post('/orgs', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
@@ -713,26 +618,46 @@ export function registerRoutes(app) {
       if (d) arr.push({ id: d.id, name: d.name, color: d.color || null });
       userToDepts.set(m.user_id, arr);
     }
+
     // If caller is a department lead, filter the list to: users in caller's departments OR unassigned users
     if (!canView || isNaN(0)) { /* no-op placeholder */ }
     if (!isNaN(1)) { /* linter appeasement */ }
     if (!canView) { /* unreachable */ }
     if (!isNaN(2)) { /* unreachable */ }
-    // Determine caller lead departments (if not admin)
-    if (!(await (async () => { try { await ensurePerm(req, 'org.manage_members'); return true; } catch { return false; } })())) {
-      const userId = req.user?.sub;
+    // Get user's actual role to determine filtering logic
+    const userId = req.user?.sub;
+    const { data: userRoleData } = await db
+      .from('organization_users')
+      .select('role')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .single();
+
+    const userRole = userRoleData?.role;
+    console.log('Users endpoint: role filtering for', userRole, 'user count:', list.length);
+    console.log('User role in org:', userRole, 'for user:', userId);
+
+    // Apply team lead filtering if user is NOT orgAdmin
+    if (userRole !== 'orgAdmin') {
+
       const { data: myLeads } = await db
         .from('department_users')
         .select('department_id')
         .eq('org_id', orgId)
         .eq('user_id', userId)
         .eq('role', 'lead');
+
       const myDeptIds = new Set((myLeads || []).map(r => r.department_id));
+      const originalCount = list.length;
+
       list = list.filter(r => {
         const deps = userToDepts.get(r.user_id) || [];
-        if (deps.length === 0) return true; // unassigned core users
-        return deps.some(d => myDeptIds.has(d.id));
+        const hasAccess = deps.length === 0 || deps.some(d => myDeptIds.has(d.id));
+        const isCurrentUser = r.user_id === userId; // Team leads always see themselves
+        return hasAccess || isCurrentUser;
       });
+
+      console.log(`Team lead ${userId} sees ${list.length}/${originalCount} users from ${myDeptIds.size} departments`);
     }
     return list.map((r) => ({
       userId: r.user_id,
@@ -746,21 +671,99 @@ export function registerRoutes(app) {
 
   app.patch('/orgs/:orgId/users/:userId', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
+    const { orgId: paramOrgId, userId } = req.params;
+
+    console.log('PATCH /orgs/:orgId/users/:userId called with:', {
+      paramOrgId,
+      userId,
+      currentUser: req.user?.sub,
+      body: req.body
+    });
+
     const orgId = await ensureActiveMember(req);
-    const { userId } = req.params;
-    const Schema = z.object({ role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/).optional(), expires_at: z.string().datetime().optional() });
+    console.log('ensureActiveMember returned orgId:', orgId);
+
+    const Schema = z.object({
+      role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/).optional(),
+      expires_at: z.string().datetime().optional(),
+      password: z.string().min(6).optional()
+    });
     const body = Schema.parse(req.body);
+    console.log('Parsed request body:', body);
+
     // Require permission to manage members
+    console.log('Checking org.manage_members permission...');
     await ensurePerm(req, 'org.manage_members');
-    const { data, error } = await db
+    console.log('Permission check passed');
+
+    // First check if user exists in the organization
+    console.log('Checking if user exists in organization:', { orgId, userId });
+    const { data: existingUser, error: checkError } = await db
       .from('organization_users')
-      .update({ role: body.role, expires_at: body.expires_at })
+      .select('user_id, role, expires_at')
       .eq('org_id', orgId)
       .eq('user_id', userId)
-      .select('*')
-      .single();
-    if (error) throw error;
-    return data;
+      .maybeSingle();
+
+    console.log('User existence check result:', { existingUser, checkError });
+
+    if (checkError) {
+      console.error('Error checking if user exists:', checkError);
+      throw new Error('Failed to verify user existence');
+    }
+
+    if (!existingUser) {
+      console.log('User not found, throwing 404 error');
+      const err = new Error(`User ${userId} not found in organization ${orgId}`);
+      err.statusCode = 404;
+      throw err;
+    }
+
+    console.log('User found, proceeding with update:', existingUser);
+
+    // Handle password update if provided
+    if (body.password) {
+      console.log('Updating password for user:', userId);
+      try {
+        await app.supabaseAdmin.auth.admin.updateUserById(userId, {
+          password: body.password,
+          email_confirm: true
+        });
+        console.log('Password updated successfully');
+      } catch (passwordError) {
+        console.error('Error updating password:', passwordError);
+        throw new Error('Failed to update password: ' + passwordError.message);
+      }
+    }
+
+    // Only update if role or expires_at are provided
+    if (body.role !== undefined || body.expires_at !== undefined) {
+      const updateData = {};
+      if (body.role !== undefined) updateData.role = body.role;
+      if (body.expires_at !== undefined) updateData.expires_at = body.expires_at;
+
+      console.log('Updating user data in database:', updateData);
+
+      const { data, error } = await db
+        .from('organization_users')
+        .update(updateData)
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .select('*')
+        .single();
+
+      if (error) {
+        console.error('Error updating user in database:', error);
+        throw new Error('Failed to update user: ' + error.message);
+      }
+
+      console.log('Database update successful, returning data');
+      return data;
+    }
+
+    // If only password was updated, return the existing user data
+    console.log('Only password was updated, returning existing user data');
+    return existingUser;
   });
 
   // Invite/create a user and add to org with optional expiry
@@ -3327,10 +3330,80 @@ export function registerRoutes(app) {
     const { data: fileBlob, error: dlErr } = await app.supabaseAdmin.storage.from('documents').download(storageKey);
     if (dlErr || !fileBlob) return reply.code(400).send({ error: 'Unable to download storage object' });
 
+    const fileSize = fileBlob.size;
+    const fileSizeMB = fileSize / (1024 * 1024);
+
+    // Store file size for use in fallback (in case AI processing fails)
+    const originalFileSizeMB = fileSizeMB;
+
+    // AI processing limits for different file types
+    const AI_SIZE_LIMITS = {
+      'application/pdf': 25,  // 25MB for PDFs (text extraction)
+      'image/jpeg': 5,        // 5MB for images
+      'image/png': 5,         // 5MB for images
+      'image/gif': 3,         // 3MB for GIFs
+      'application/msword': 10,  // 10MB for DOC
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 10, // 10MB for DOCX
+      'application/vnd.ms-powerpoint': 15, // 15MB for PPT
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 15, // 15MB for PPTX
+      'text/plain': 1,        // 1MB for text files
+      'text/markdown': 1,     // 1MB for markdown
+    };
+
+    const mimeTypeKey = mimeType || fileBlob.type;
+    const sizeLimit = AI_SIZE_LIMITS[mimeTypeKey] || 5; // Default 5MB limit
+
+    // Check if file is too large for AI processing
+    if (fileSizeMB > sizeLimit) {
+      console.log(`File too large for AI processing: ${fileSizeMB.toFixed(2)}MB (limit: ${sizeLimit}MB) for ${mimeTypeKey}`);
+
+      // Enhanced fallback for large files
+      const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
+      const fileExtension = baseName.split('.').pop()?.toLowerCase() || '';
+
+      // Generate better fallback metadata based on file type
+      let enhancedFallback = {
+        title: baseName.replace(/\.[^/.]+$/, ""), // Remove extension from title
+        subject: `${baseName} - Large Document`,
+        keywords: [baseName, fileExtension.toUpperCase(), 'large-file', 'document'],
+        tags: ['document', 'large-file', fileExtension || 'unknown'],
+        summary: `Large ${fileExtension.toUpperCase() || 'document'} file (${fileSizeMB.toFixed(1)}MB) - AI processing skipped due to size limits. Please review and add metadata manually if needed.`,
+        description: `This is a large file that exceeded the AI processing limit of ${sizeLimit}MB. The document has been uploaded successfully but AI analysis was skipped to prevent processing timeouts.`,
+        category: availableCategories.includes('General') ? 'General' : availableCategories[0],
+      };
+
+      // Add file-type specific metadata
+      if (['pdf'].includes(fileExtension)) {
+        enhancedFallback.tags.push('pdf', 'readable');
+        enhancedFallback.category = availableCategories.includes('Report') ? 'Report' : enhancedFallback.category;
+      } else if (['doc', 'docx'].includes(fileExtension)) {
+        enhancedFallback.tags.push('word', 'editable');
+        enhancedFallback.category = availableCategories.includes('Correspondence') ? 'Correspondence' : enhancedFallback.category;
+      } else if (['ppt', 'pptx'].includes(fileExtension)) {
+        enhancedFallback.tags.push('presentation', 'slides');
+        enhancedFallback.category = availableCategories.includes('Report') ? 'Report' : enhancedFallback.category;
+      } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileExtension)) {
+        enhancedFallback.tags.push('image', 'visual');
+        enhancedFallback.category = availableCategories.includes('General') ? 'General' : enhancedFallback.category;
+      }
+
+      return reply.code(413).send({
+        error: `File too large for AI processing (${fileSizeMB.toFixed(2)}MB exceeds ${sizeLimit}MB limit)`,
+        fallback: {
+          ocrText: '',
+          metadata: enhancedFallback,
+        },
+      });
+    }
+
     const arr = await fileBlob.arrayBuffer();
     const b64 = Buffer.from(arr).toString('base64');
     const ct = mimeType || fileBlob.type || 'application/octet-stream';
     const dataUri = `data:${ct};base64,${b64}`;
+
+    // Add timeout for AI processing based on file size
+    const timeoutMs = Math.min(30000 + (fileSizeMB * 2000), 120000); // Base 30s + 2s per MB, max 2min
+    console.log(`Processing file with AI: ${fileSizeMB.toFixed(2)}MB, timeout: ${timeoutMs}ms`);
 
     const ocrPrompt = ai.definePrompt({ name: 'ocrPrompt', input: { schema: z.object({ dataUri: z.string() }) }, output: { schema: z.object({ extractedText: z.string().optional() }) }, prompt: `Extract the readable text from the following document:\n\n{{media url=dataUri}}` });
     const metaPrompt = ai.definePrompt({
@@ -3385,16 +3458,38 @@ Document: {{media url=dataUri}}`,
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     function isRetryable(err) {
       const msg = String(err?.message || '').toLowerCase();
-      return err?.status === 429 || err?.status === 503 || msg.includes('overloaded') || msg.includes('rate') || msg.includes('unavailable');
+      return err?.status === 429 ||
+             err?.status === 503 ||
+             msg.includes('overloaded') ||
+             msg.includes('rate') ||
+             msg.includes('unavailable') ||
+             msg.includes('timeout') ||
+             msg.includes('processing timeout');
     }
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const [{ output: ocr }, { output: meta }] = await Promise.all([
-          ocrPrompt({ dataUri }),
-          metaPrompt({ dataUri }),
+        // Add timeout wrapper for AI processing
+        const processWithTimeout = async () => {
+          return await Promise.all([
+            ocrPrompt({ dataUri }),
+            metaPrompt({ dataUri }),
+          ]);
+        };
+
+        // Create a timeout promise
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`AI processing timeout after ${timeoutMs}ms`)), timeoutMs);
+        });
+
+        // Race between AI processing and timeout
+        const [ocrResult, metaResult] = await Promise.race([
+          processWithTimeout(),
+          timeoutPromise
         ]);
+
+        const [{ output: ocr }, { output: meta }] = [ocrResult, metaResult];
         // Post-process to guarantee required fields, even for images
         const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
         const ensured = {
@@ -3416,19 +3511,55 @@ Document: {{media url=dataUri}}`,
       }
     }
 
-    // Fallback: return minimal metadata so UI can proceed; user can edit fields
+    // Enhanced fallback: return better metadata so UI can proceed; user can edit fields
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
+    const fileExtension = baseName.split('.').pop()?.toLowerCase() || '';
+    const fallbackFileSizeMB = originalFileSizeMB;
+
+    // Determine the reason for fallback
+    let fallbackReason = 'AI temporarily unavailable';
+    let userGuidance = 'The document has been uploaded successfully. You can manually add metadata or try uploading a smaller file.';
+
+    if (lastErr?.message?.includes('timeout')) {
+      fallbackReason = 'AI processing timeout';
+      userGuidance = `The document (${fallbackFileSizeMB.toFixed(1)}MB) took too long to process. Try uploading a smaller file or the document will be processed in the background.`;
+    } else if (lastErr?.status === 429) {
+      fallbackReason = 'AI rate limit exceeded';
+      userGuidance = 'Too many requests to AI service. Please wait a moment and try again.';
+    } else if (lastErr?.status === 503) {
+      fallbackReason = 'AI service overloaded';
+      userGuidance = 'AI service is temporarily busy. The document will be processed in the background when service is available.';
+    }
+
+    // Enhanced fallback metadata
+    const enhancedFallback = {
+      title: baseName.replace(/\.[^/.]+$/, ""), // Remove extension from title
+      subject: `${baseName} - ${fallbackReason}`,
+      keywords: [baseName, fileExtension.toUpperCase(), 'document', 'ai-failed'],
+      tags: ['document', fileExtension || 'unknown', 'ai-fallback'],
+      summary: `${fallbackReason}. ${userGuidance} File size: ${fallbackFileSizeMB.toFixed(1)}MB.`,
+      description: `Document uploaded successfully but AI analysis failed: ${fallbackReason}. ${userGuidance}`,
+      category: availableCategories.includes('General') ? 'General' : availableCategories[0],
+    };
+
+    // Add file-type specific metadata
+    if (['pdf'].includes(fileExtension)) {
+      enhancedFallback.tags.push('pdf', 'readable');
+    } else if (['doc', 'docx'].includes(fileExtension)) {
+      enhancedFallback.tags.push('word', 'editable');
+    } else if (['ppt', 'pptx'].includes(fileExtension)) {
+      enhancedFallback.tags.push('presentation', 'slides');
+    } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileExtension)) {
+      enhancedFallback.tags.push('image', 'visual');
+    }
+
+    console.log(`AI processing failed: ${fallbackReason}. File: ${baseName} (${fallbackFileSizeMB.toFixed(2)}MB)`);
+
     return reply.code(503).send({
-      error: 'AI temporarily unavailable',
+      error: fallbackReason,
       fallback: {
         ocrText: '',
-        metadata: {
-          title: baseName,
-          subject: baseName,
-          keywords: [baseName],
-          tags: ['document'],
-          description: '',
-        },
+        metadata: enhancedFallback,
       },
     });
   });
@@ -5288,4 +5419,7 @@ Document: {{media url=dataUri}}`,
       return reply.code(500).send({ error: 'Failed to serve file' });
     }
   });
+
+  // Register all route modules (dashboard, future modules, etc.)
+  registerAllRoutes(app);
 }
