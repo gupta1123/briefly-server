@@ -2024,7 +2024,8 @@ export function registerRoutes(app) {
           // Limit to user's departments
         } else {
           // User has no department access - NO documents visible
-          query = query.eq('department_id', 'never-matches-anything');
+          // Use a proper UUID format that will never match any real department
+          query = query.eq('department_id', '00000000-0000-0000-0000-000000000000');
           // User has no accessible departments
         }
       }

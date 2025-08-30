@@ -13,7 +13,14 @@ async function main() {
   const env = loadEnv();
   const app = Fastify({ logger: true });
 
-  await app.register(cors, { origin: true, credentials: true });
+  await app.register(cors, { 
+    origin: [
+      'https://brieflydocs.netlify.app',
+      'http://localhost:3000',
+      'http://localhost:3001'
+    ], 
+    credentials: true 
+  });
   await app.register(sse);
   await app.register(jwt, { secret: env.SUPABASE_JWT_SECRET });
   await app.register(multipart);
