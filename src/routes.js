@@ -4,6 +4,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { routeQuestion } from './agents/router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
+import agentOrchestrator from './agents/agent-orchestrator.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -370,10 +371,10 @@ export function registerRoutes(app) {
       permissions = await getMyPermissions(req, selectedOrgId);
     }
 
-    // 7) departments with membership flags
+    // 7) departments with membership flags and categories
     const { data: depts, error: dErr } = await db
       .from('departments')
-      .select('id, org_id, name, lead_user_id, color, created_at, updated_at')
+      .select('id, org_id, name, lead_user_id, color, categories, created_at, updated_at')
       .eq('org_id', selectedOrgId)
       .order('name');
     if (dErr) throw dErr;
@@ -384,7 +385,12 @@ export function registerRoutes(app) {
       .eq('user_id', userId);
     const memSet = new Set((myDU || []).map((r) => r.department_id));
     const leadSet = new Set((myDU || []).filter((r) => r.role === 'lead').map((r) => r.department_id));
-    const departments = (depts || []).map((d) => ({ ...d, is_member: memSet.has(d.id), is_lead: leadSet.has(d.id) }));
+    const departments = (depts || []).map((d) => ({ 
+      ...d, 
+      is_member: memSet.has(d.id), 
+      is_lead: leadSet.has(d.id),
+      categories: d.categories || ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence']
+    }));
 
     const result = {
       user: { id: userId, displayName: userRow?.display_name || null },
@@ -687,15 +693,18 @@ export function registerRoutes(app) {
     const Schema = z.object({
       role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/).optional(),
       expires_at: z.string().datetime().optional(),
-      password: z.string().min(6).optional()
+      password: z.string().min(6).optional(),
+      display_name: z.string().optional()
     });
     const body = Schema.parse(req.body);
     console.log('Parsed request body:', body);
 
-    // Require permission to manage members
-    console.log('Checking org.manage_members permission...');
-    await ensurePerm(req, 'org.manage_members');
-    console.log('Permission check passed');
+    // Check permissions for managing members
+    console.log('Checking permissions for user management...');
+    const callerId = req.user?.sub;
+    const callerOrgRole = await getUserOrgRole(req);
+    const isAdmin = callerOrgRole === 'orgAdmin';
+    const isTeamLead = callerOrgRole === 'teamLead';
 
     // First check if user exists in the organization
     console.log('Checking if user exists in organization:', { orgId, userId });
@@ -714,38 +723,258 @@ export function registerRoutes(app) {
     }
 
     if (!existingUser) {
-      console.log('User not found, throwing 404 error');
+      console.log('User not found in organization_users, checking if they exist in department_users...');
+
+      // Check if user exists in department_users for this org
+      const { data: deptUser, error: deptError } = await db
+        .from('department_users')
+        .select('user_id, department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (deptError) {
+        console.error('Error checking department_users:', deptError);
+      }
+
+      if (deptUser) {
+        console.log('User found in department_users but not organization_users. Auto-creating organization membership...', {
+          orgId,
+          userId,
+          deptUser
+        });
+
+        // Verify the organization exists
+        const { data: orgCheck, error: orgError } = await app.supabaseAdmin
+          .from('organizations')
+          .select('id')
+          .eq('id', orgId)
+          .maybeSingle();
+
+        if (orgError) {
+          console.error('Error checking if organization exists:', orgError);
+          const err = new Error(`Failed to verify organization: ${orgError.message}`);
+          err.statusCode = 500;
+          throw err;
+        }
+
+        if (!orgCheck) {
+          console.error('Organization not found:', orgId);
+          const err = new Error(`Organization ${orgId} not found`);
+          err.statusCode = 404;
+          throw err;
+        }
+
+        console.log('Organization verified, proceeding with user creation...');
+
+        // Verify the user exists in auth system
+        console.log('Verifying user exists in auth system...');
+        try {
+          const authUser = await getAdminUserCached(app, userId);
+          console.log('Auth user verified:', { id: authUser.id, email: authUser.email });
+        } catch (authError) {
+          console.error('Auth user verification failed:', authError);
+          const err = new Error(`User ${userId} not found in auth system: ${authError.message}`);
+          err.statusCode = 404;
+          throw err;
+        }
+
+        // Try to auto-create organization membership with default role using service role to bypass RLS
+        console.log('Attempting to insert organization membership using service role...');
+        const { data: newOrgUser, error: createError } = await app.supabaseAdmin
+          .from('organization_users')
+          .insert({
+            org_id: orgId,
+            user_id: userId,
+            role: 'member' // Default role
+          })
+          .select('*')
+          .single();
+
+        console.log('Insert result:', { newOrgUser, createError });
+
+        if (createError) {
+          console.error('Error auto-creating organization membership:', {
+            error: createError,
+            code: createError.code,
+            message: createError.message,
+            details: createError.details,
+            hint: createError.hint,
+            orgId,
+            userId
+          });
+
+          // Check if user already exists (race condition or duplicate)
+          if (createError.code === '23505') { // Unique violation
+            console.log('User already exists in organization_users, fetching existing record...');
+            const { data: existingOrgUser, error: fetchError } = await app.supabaseAdmin
+              .from('organization_users')
+              .select('*')
+              .eq('org_id', orgId)
+              .eq('user_id', userId)
+              .maybeSingle();
+
+            if (fetchError) {
+              console.error('Error fetching existing user:', fetchError);
+              const err = new Error(`User ${userId} exists but failed to fetch: ${fetchError.message}`);
+              err.statusCode = 500;
+              throw err;
+            }
+
+            if (existingOrgUser) {
+              console.log('Found existing organization membership:', existingOrgUser);
+              return existingOrgUser;
+            }
+          }
+
+          const err = new Error(`User ${userId} found in department but failed to create organization membership: ${createError.message}`);
+          err.statusCode = 500;
+          throw err;
+        }
+
+        console.log('Successfully auto-created organization membership:', newOrgUser);
+        return newOrgUser;
+      } else {
+        console.log('User not found in department_users either, throwing 404 error');
       const err = new Error(`User ${userId} not found in organization ${orgId}`);
       err.statusCode = 404;
       throw err;
+      }
     }
 
-    console.log('User found, proceeding with update:', existingUser);
+    // At this point, existingUser is either the original or the newly created org user
+    const userToCheck = existingUser;
+    console.log('User found/created, proceeding with permission check:', userToCheck);
+
+    let canManageUser = false;
+
+    if (isAdmin) {
+      // Admins can manage all users
+      console.log('User is admin, granting full access');
+      canManageUser = true;
+    } else if (isTeamLead) {
+      // Team leads can only manage users in their departments
+      console.log('User is team lead, checking department membership...');
+
+      // Check if target user is in caller's department
+      const { data: sharedDepartment } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', callerId)
+        .eq('role', 'lead');
+
+      if (sharedDepartment && sharedDepartment.length > 0) {
+        // Check if target user is in any of the caller's departments
+        const callerDeptIds = sharedDepartment.map(d => d.department_id);
+        const { data: targetUserDept } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', userId)
+          .in('department_id', callerDeptIds)
+          .maybeSingle();
+
+            if (targetUserDept) {
+      // Additional checks for team leads
+      if (userId === callerId) {
+        console.log('Team lead cannot edit themselves');
+        canManageUser = false;
+      } else if (userToCheck.role === 'orgAdmin') {
+        console.log('Team lead cannot edit org admins');
+        canManageUser = false;
+      } else {
+        console.log('Target user is in caller\'s department, allowing edit');
+        canManageUser = true;
+      }
+    } else {
+      console.log('Target user is not in caller\'s department');
+    }
+      } else {
+        console.log('Caller is not a department lead');
+      }
+    }
+
+    if (!canManageUser) {
+      console.log('Permission denied for user management');
+      const err = new Error('Forbidden: Insufficient permissions to manage this user');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    console.log('Permission check passed');
 
     // Handle password update if provided
     if (body.password) {
-      console.log('Updating password for user:', userId);
+      console.log('🔐 Updating password for user:', userId, 'Caller role:', isAdmin ? 'admin' : 'team_lead');
+
+      // For team leads, we already verified the user exists through department membership
+      // For admins, verify the user exists in Supabase Auth
+      if (isAdmin) {
+        try {
+          const authUser = await getAdminUserCached(app, userId);
+          console.log('✅ User found in Supabase Auth (admin check):', { id: authUser.email ? 'exists' : 'no-email', email: authUser.email });
+        } catch (authError) {
+          console.error('❌ User not found in Supabase Auth (admin check):', authError);
+          throw new Error('User not found in authentication system');
+        }
+      } else if (isTeamLead) {
+        console.log('ℹ️ Team lead password change - skipping auth verification (user already validated via department membership)');
+      }
+
       try {
-        await app.supabaseAdmin.auth.admin.updateUserById(userId, {
+        // Update password with email confirmation
+        console.log('🔄 Attempting password update via Supabase Admin API...');
+        const updateResult = await app.supabaseAdmin.auth.admin.updateUserById(userId, {
           password: body.password,
           email_confirm: true
         });
-        console.log('Password updated successfully');
+
+        // Add a small delay to ensure the change is processed
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        console.log('✅ Password updated successfully for user:', userId, 'Result:', updateResult);
+
+        // For team leads, skip verification as they might not have permission
+        if (isAdmin) {
+          try {
+            const verifyUser = await app.supabaseAdmin.auth.admin.getUserById(userId);
+            console.log('✅ User verification after password change (admin):', {
+              id: verifyUser.data.user?.id,
+              email: verifyUser.data.user?.email,
+              emailConfirmed: verifyUser.data.user?.email_confirmed_at
+            });
+          } catch (verifyError) {
+            console.warn('⚠️ Could not verify user after password change (admin):', verifyError);
+          }
+        } else if (isTeamLead) {
+          console.log('ℹ️ Team lead password change completed - skipping verification');
+        }
+
       } catch (passwordError) {
-        console.error('Error updating password:', passwordError);
+        console.error('❌ Error updating password:', passwordError);
+
+        // For team leads, provide more specific error handling
+        if (isTeamLead && passwordError.message?.includes('permission')) {
+          console.error('🚫 Team lead does not have permission to update user passwords via Supabase Admin API');
+          throw new Error('Team leads cannot change user passwords due to permission restrictions. Please contact an administrator.');
+        }
+
         throw new Error('Failed to update password: ' + passwordError.message);
       }
     }
 
-    // Only update if role or expires_at are provided
-    if (body.role !== undefined || body.expires_at !== undefined) {
+    // Only update if role, expires_at, or display_name are provided
+    if (body.role !== undefined || body.expires_at !== undefined || body.display_name !== undefined) {
       const updateData = {};
       if (body.role !== undefined) updateData.role = body.role;
       if (body.expires_at !== undefined) updateData.expires_at = body.expires_at;
+      if (body.display_name !== undefined) updateData.display_name = body.display_name;
 
       console.log('Updating user data in database:', updateData);
 
-      const { data, error } = await db
+      // Update organization_users table
+      const { data: orgUserData, error: orgError } = await db
         .from('organization_users')
         .update(updateData)
         .eq('org_id', orgId)
@@ -753,18 +982,35 @@ export function registerRoutes(app) {
         .select('*')
         .single();
 
-      if (error) {
-        console.error('Error updating user in database:', error);
-        throw new Error('Failed to update user: ' + error.message);
+      if (orgError) {
+        console.error('Error updating user in organization_users:', orgError);
+        throw new Error('Failed to update user: ' + orgError.message);
+      }
+
+      // If display_name was updated, also update app_users table
+      if (body.display_name !== undefined) {
+        console.log('Updating display_name in app_users table');
+        const { error: appError } = await db
+          .from('app_users')
+          .update({ display_name: body.display_name })
+          .eq('id', userId);
+
+        if (appError) {
+          console.error('Error updating display_name in app_users:', appError);
+          // Don't throw here as the org_users update succeeded
+          // Just log the error for monitoring
+        } else {
+          console.log('Successfully updated display_name in app_users');
+        }
       }
 
       console.log('Database update successful, returning data');
-      return data;
+      return orgUserData;
     }
 
-    // If only password was updated, return the existing user data
-    console.log('Only password was updated, returning existing user data');
-    return existingUser;
+    // If only password was updated, return the user data
+    console.log('Only password was updated, returning user data');
+    return userToCheck;
   });
 
   // Invite/create a user and add to org with optional expiry
@@ -800,7 +1046,16 @@ export function registerRoutes(app) {
     // Create auth user with a password (generate if not provided) and confirm email
     let authUserId = null;
     const tempPassword = body.password || Math.random().toString(36).slice(2, 10) + 'A!1';
+    const hasProvidedPassword = !!body.password;
     let generated = false;
+
+    console.log('👤 Creating user:', {
+      email: body.email,
+      hasProvidedPassword,
+      generatedPassword: !hasProvidedPassword,
+      callerRole: isAdmin ? 'admin' : 'team_lead'
+    });
+
     try {
       const { data, error } = await app.supabaseAdmin.auth.admin.createUser({
         email: body.email,
@@ -810,15 +1065,20 @@ export function registerRoutes(app) {
       });
       if (error) throw error;
       authUserId = data?.user?.id || null;
+      console.log('✅ User created in Supabase Auth:', { id: authUserId, email: body.email });
     } catch (e) {
       // If the user already exists, try to find by iterating admin list and matching email
       try {
         const { data: list } = await app.supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
         const found = (list?.users || []).find((u) => (u.email || '').toLowerCase() === body.email.toLowerCase());
         authUserId = found?.id || null;
+        console.log('ℹ️ User already exists in Supabase Auth:', { id: authUserId, email: body.email });
+
         // If a password was provided for an existing user, set it so password login works
         if (authUserId && body.password) {
+          console.log('🔄 Updating password for existing user:', authUserId);
           await app.supabaseAdmin.auth.admin.updateUserById(authUserId, { password: body.password, email_confirm: true });
+          console.log('✅ Password updated for existing user');
         }
       } catch {}
     }
@@ -1281,6 +1541,35 @@ export function registerRoutes(app) {
       .select('*')
       .single();
     if (error) throw error;
+
+    // Update department's lead_user_id if assigning/removing lead role
+    if (body.role === 'lead') {
+      // Setting a new lead - update department.lead_user_id
+      await db
+        .from('departments')
+        .update({ lead_user_id: body.userId })
+        .eq('org_id', orgId)
+        .eq('id', deptId);
+    } else {
+      // Check if this user was previously a lead and is being demoted
+      const { data: existingUser } = await db
+        .from('department_users')
+        .select('role')
+        .eq('org_id', orgId)
+        .eq('department_id', deptId)
+        .eq('user_id', body.userId)
+        .single();
+
+      // If user was previously a lead and is now being changed to non-lead, clear lead_user_id
+      if (existingUser?.role === 'lead') {
+        await db
+          .from('departments')
+          .update({ lead_user_id: null })
+          .eq('org_id', orgId)
+          .eq('id', deptId);
+      }
+    }
+
     return data;
   });
 
@@ -1336,6 +1625,15 @@ export function registerRoutes(app) {
       }
     }
     
+    // Check if the user being removed is a lead
+    const { data: userToRemove } = await db
+      .from('department_users')
+      .select('role')
+      .eq('org_id', orgId)
+      .eq('department_id', deptId)
+      .eq('user_id', userId)
+      .single();
+
     const { error } = await db
       .from('department_users')
       .delete()
@@ -1343,6 +1641,16 @@ export function registerRoutes(app) {
       .eq('department_id', deptId)
       .eq('user_id', userId);
     if (error) throw error;
+
+    // If the removed user was a lead, clear the department's lead_user_id
+    if (userToRemove?.role === 'lead') {
+      await db
+        .from('departments')
+        .update({ lead_user_id: null })
+        .eq('org_id', orgId)
+        .eq('id', deptId);
+    }
+
     return { ok: true };
   });
 
@@ -1954,39 +2262,97 @@ export function registerRoutes(app) {
           err.statusCode = 403; throw err;
         }
       } else {
-        if (uniq.length === 1) departmentId = uniq[0];
-        else {
-          const err = new Error('Please select a team to create this document');
-          err.statusCode = 400; throw err;
+        // Try to inherit department from parent folder first
+        if (body.folderPath && Array.isArray(body.folderPath) && body.folderPath.length > 0) {
+          try {
+            // Find the parent folder by traversing up the path
+            let parentPath = body.folderPath.slice(0, -1); // Remove the filename part
+            while (parentPath.length > 0) {
+              const { data: parentFolder } = await db
+                .from('documents')
+                .select('department_id')
+                .eq('org_id', orgId)
+                .eq('type', 'folder')
+                .eq('folder_path', parentPath)
+                .maybeSingle();
+
+              if (parentFolder?.department_id && uniq.includes(parentFolder.department_id)) {
+                departmentId = parentFolder.department_id;
+                console.log(`✅ [NON-ADMIN] Inherited department ${departmentId} from parent folder path: ${parentPath.join('/')}`);
+                break;
+              } else if (parentFolder?.department_id) {
+                console.log(`⚠️ [NON-ADMIN] Found parent folder but department ${parentFolder.department_id} not in user's allowed departments: ${uniq.join(', ')}`);
+              }
+              // Try the next level up
+              parentPath = parentPath.slice(0, -1);
+            }
+          } catch (error) {
+            console.error('❌ [NON-ADMIN] Error inheriting department from parent folder:', error);
+          }
+          if (!departmentId) {
+            console.log(`ℹ️ [NON-ADMIN] No department inherited from folder path: ${body.folderPath.slice(0, -1).join('/')}`);
+          }
+        }
+
+        // If still no department, use the single membership or require selection
+        if (!departmentId) {
+          if (uniq.length === 1) departmentId = uniq[0];
+          else {
+            const err = new Error('Please select a team to create this document');
+            err.statusCode = 400; throw err;
+          }
         }
       }
     } else {
-      // Admins: MUST specify a department - no more null department documents
-      // This prevents accidental leaking of admin-created content
+      // Admins: Try to inherit from parent folder first, then use memberships
       if (!departmentId) {
-        try {
-          const { data: general } = await db
-            .from('departments')
-            .select('id')
-            .eq('org_id', orgId)
-            .eq('name', 'General')
-            .maybeSingle();
-          if (general?.id) {
-            departmentId = general.id;
-          } else {
-            // If no General department exists, create one for admin content
-            const { data: newGeneral } = await db
-              .from('departments')
-              .insert({ org_id: orgId, name: 'General' })
-              .select('id')
-              .single();
-            departmentId = newGeneral.id;
+        // First, try to inherit department from parent folder
+        if (body.folderPath && Array.isArray(body.folderPath) && body.folderPath.length > 0) {
+          try {
+            // Find the parent folder by traversing up the path
+            let parentPath = body.folderPath.slice(0, -1); // Remove the filename part
+            while (parentPath.length > 0) {
+              const { data: parentFolder } = await db
+                .from('documents')
+                .select('department_id')
+                .eq('org_id', orgId)
+                .eq('type', 'folder')
+                .eq('folder_path', parentPath)
+                .maybeSingle();
+
+              if (parentFolder?.department_id) {
+                departmentId = parentFolder.department_id;
+                console.log(`✅ [ADMIN] Inherited department ${departmentId} from parent folder path: ${parentPath.join('/')}`);
+                break;
+              }
+              // Try the next level up
+              parentPath = parentPath.slice(0, -1);
+            }
+          } catch (error) {
+            console.error('❌ [ADMIN] Error inheriting department from parent folder:', error);
           }
-        } catch (error) {
-          // Fallback: require explicit department selection
-          const err = new Error('Please specify a department for this document');
-          err.statusCode = 400; 
-          throw err;
+          if (!departmentId) {
+            console.log(`ℹ️ [ADMIN] No department inherited from folder path: ${body.folderPath.slice(0, -1).join('/')}`);
+          }
+        }
+
+        // If still no department, use admin's department memberships
+        if (!departmentId) {
+          const { data: adminDepts } = await db
+            .from('department_users')
+            .select('department_id, departments(name)')
+            .eq('org_id', orgId)
+            .eq('user_id', userId);
+
+          if (adminDepts && adminDepts.length > 0) {
+            // Use the first department the admin is a member of
+            departmentId = adminDepts[0].department_id;
+          } else {
+            // Admin has no department memberships - require explicit selection
+            const err = new Error('Please select a department for this document. You are not a member of any departments.');
+            err.statusCode = 400;
+            throw err;
+          }
         }
       }
     }
@@ -2723,18 +3089,81 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/folders', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
     const pathStr = String((req.query?.path || ''));
     const pathArr = pathStr ? pathStr.split('/').filter(Boolean) : [];
-    const { data, error } = await db.from('documents').select('folder_path').eq('org_id', orgId);
-    if (error) throw error;
-    const children = new Set();
-    for (const row of data || []) {
-      const p = row.folder_path || [];
-      if (p.length >= pathArr.length + 1 && pathArr.every((seg, i) => seg === p[i])) {
-        children.add(p[pathArr.length]);
+
+    // Get folder documents with department information
+    const { data, error } = await db
+      .from('documents')
+      .select('id, folder_path, department_id, title')
+      .eq('org_id', orgId)
+      .eq('type', 'folder');
+
+    // Get department names for the folders
+    let departmentMap = new Map();
+    if (data && data.length > 0) {
+      const deptIds = data
+        .map(d => d.department_id)
+        .filter(id => id !== null);
+
+      if (deptIds.length > 0) {
+        const { data: depts } = await db
+          .from('departments')
+          .select('id, name')
+          .in('id', deptIds);
+
+        departmentMap = new Map(
+          (depts || []).map(dept => [dept.id, dept.name])
+        );
       }
     }
-    return Array.from(children).sort().map((name) => ({ name, fullPath: [...pathArr, name] }));
+
+    if (error) throw error;
+
+    // For non-admin users, filter folders to only show those in departments they can access
+    let filteredData = data || [];
+    const userRole = await getUserOrgRole(req);
+    if (userRole !== 'orgAdmin') {
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+
+      const allowedDeptIds = (userDepts || []).map(d => d.department_id);
+      filteredData = filteredData.filter(folder => folder.department_id && allowedDeptIds.includes(folder.department_id));
+    }
+
+    const children = new Set();
+    const folderInfo = new Map();
+
+    for (const row of filteredData) {
+      const p = row.folder_path || [];
+      if (p.length >= pathArr.length + 1 && pathArr.every((seg, i) => seg === p[i])) {
+        const folderName = p[pathArr.length];
+        children.add(folderName);
+        // Store folder info including department
+        folderInfo.set(folderName, {
+          id: row.id,
+          departmentId: row.department_id,
+          title: row.title
+        });
+      }
+    }
+
+    return Array.from(children).sort().map((name) => {
+      const info = folderInfo.get(name);
+      const departmentName = info?.departmentId ? departmentMap.get(info.departmentId) : null;
+      return {
+        name,
+        fullPath: [...pathArr, name],
+        departmentId: info?.departmentId,
+        departmentName: departmentName,
+        id: info?.id,
+        title: info?.title
+      };
+    });
   });
 
   app.post('/orgs/:orgId/folders', { preHandler: app.verifyAuth }, async (req) => {
@@ -3704,48 +4133,152 @@ Document: {{media url=dataUri}}`,
       lastListDocIds: lastListDocIds.length ? lastListDocIds : undefined,
       filters: userMemory.filters || undefined,
     };
-    const decision = await routeQuestion({ question, history: conversation, memory });
-    function choosePrimary(d) {
-      if (d && typeof d.primaryAgent === 'string') return d.primaryAgent;
-      switch (d?.intent) {
-        case 'FindFiles': return 'finder';
-        case 'Metadata': return 'metadata';
-        case 'ContentQA': return 'content';
-        case 'Linked': return 'linked';
-        case 'Diff': return 'diff';
-        case 'Analytics': return 'analytics';
-        case 'Timeline': return 'timeline';
-        case 'Extract': return 'extract';
-        default: return 'content';
-      }
-    }
-    let primary = choosePrimary(decision);
-    send('mode', { mode: primary, intent: decision.intent, confidence: decision.confidence });
-    send('stage', { agent: 'RouterAgent', step: 'classified', mode: primary, intent: decision.intent });
+    // Use new agent orchestrator for routing
+    const routingResult = await agentOrchestrator.processQuestion(db, question, [], conversation);
+
+    // For backward compatibility, map agent types to legacy modes
+    const agentTypeToLegacyMode = {
+      'metadata': 'metadata',
+      'content': 'content',
+      'financial': 'analytics',
+      'resume': 'content',
+      'legal': 'content'
+    };
+
+    const primary = agentTypeToLegacyMode[routingResult.agentType] || 'content';
+    send('mode', {
+      mode: primary,
+      agentType: routingResult.agentType,
+      agentName: routingResult.agentName,
+      intent: routingResult.intent,
+      confidence: routingResult.confidence
+    });
+    send('stage', {
+      agent: routingResult.agentName,
+      step: 'routed',
+      mode: primary,
+      agentType: routingResult.agentType
+    });
 
     // If the router signals ambiguity/low confidence, ask a short clarifying question
     const veryShort = String(question || '').trim().split(/\s+/).filter(Boolean).length < 2;
-    if (veryShort || decision?.needsClarification || (typeof decision?.confidence === 'number' && decision.confidence < 0.4)) {
+    if (veryShort || routingResult.confidence < 0.6) {
       send('delta', 'Do you want files, metadata, content Q&A, linked docs, differences, analytics, a timeline, or a field extract?');
       send('end', { done: true, citations: [] });
       return;
     }
 
-    // Route adjustment: if router chose finder but the target indicates a specific doc (focus/list/ordinal),
-    // prefer a doc-focused agent (metadata/content) based on answerType/requiredFields
+    // For now, keep the agent type as determined by the router
+    // Future enhancement: add logic to adjust agent based on document context
     let adjusted = primary;
-    const preferDoc = (decision?.target?.prefer && decision.target.prefer !== 'none') || (Array.isArray(lastListDocIds) && lastListDocIds.length > 0) || (Array.isArray(memory.focusDocIds) && memory.focusDocIds.length > 0);
-    if (primary === 'finder' && preferDoc) {
-      const reqFields = Array.isArray(decision?.requiredFields) ? decision.requiredFields.map(String) : [];
-      const wantsMeta = decision?.answerType === 'metadata' || reqFields.some(k => /subject|sender|receiver|filename|tags|category|summary/i.test(String(k)));
-      adjusted = wantsMeta ? 'metadata' : 'content';
-      if (adjusted !== primary) {
-        primary = adjusted;
-        send('stage', { agent: 'RouterAgent', step: 'route_adjusted', mode: primary, intent: decision.intent });
-        send('mode', { mode: primary, intent: decision.intent, confidence: decision.confidence });
+
+    // NEW AGENT SYSTEM INTEGRATION
+    // If we have a specialized agent, use it instead of legacy logic
+    if (routingResult.agentType !== 'content') {
+      try {
+        // Embed query via OpenAI REST API
+        async function embedQuery(text) {
+          const apiKey = process.env.OPENAI_API_KEY;
+          if (!apiKey) return null;
+          const res = await fetch('https://api.openai.com/v1/embeddings', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
+          });
+          if (!res.ok) {
+            const errTxt = await res.text().catch(() => '');
+            throw new Error(`OpenAI embeddings error: ${res.status} ${errTxt}`);
+          }
+          const data = await res.json();
+          const emb = data?.data?.[0]?.embedding;
+          return Array.isArray(emb) ? emb : null;
+        }
+
+        // Search for relevant documents first
+        let relevantDocuments = [];
+
+        if (routingResult.agentType === 'metadata') {
+          // Metadata agent: search documents by metadata only
+          const { data, error } = await db
+            .from('documents')
+            .select('id, title, filename, sender, receiver, document_date, document_type, category, tags')
+            .eq('org_id', orgId)
+            .limit(20);
+          relevantDocuments = data || [];
+        } else {
+          // Other agents: use semantic search
+          if (allowSemantic) {
+            const embedding = await embedQuery(question).catch(() => null);
+            if (embedding) {
+              const { data: chunks } = await db.rpc('match_doc_chunks', {
+                p_org_id: orgId,
+                p_query_embedding: embedding,
+                p_match_count: 24,
+                p_similarity_threshold: 0
+              });
+
+              if (chunks && chunks.length > 0) {
+                const docIds = [...new Set(chunks.map(c => c.doc_id))];
+                const { data: docs } = await db
+                  .from('documents')
+                  .select('id, title, filename, sender, receiver, document_date, document_type, category, tags, content')
+                  .eq('org_id', orgId)
+                  .in('id', docIds);
+
+                // Add snippets to documents
+                relevantDocuments = (docs || []).map(doc => {
+                  const docChunks = chunks.filter(c => c.doc_id === doc.id);
+                  return {
+                    ...doc,
+                    content: docChunks.map(c => c.content).join('\n---\n')
+                  };
+                });
+              }
+            }
+          }
+        }
+
+        // Process with the appropriate agent
+        const agentResult = await agentOrchestrator.processQuestion(
+          db,
+          question,
+          relevantDocuments,
+          conversation,
+          routingResult.agentType
+        );
+
+        // Send response
+        send('delta', agentResult.answer);
+
+        // Send citations if available
+        if (agentResult.citations && agentResult.citations.length > 0) {
+          send('end', {
+            done: true,
+            citations: agentResult.citations,
+            agentType: agentResult.agentType,
+            agentName: agentResult.agentName
+          });
+        } else {
+          send('end', {
+            done: true,
+            citations: [],
+            agentType: agentResult.agentType,
+            agentName: agentResult.agentName
+          });
+        }
+
+        return;
+      } catch (agentError) {
+        console.error('Agent processing error:', agentError);
+        // Fall back to legacy system
+        send('stage', { agent: 'System', step: 'fallback_to_legacy' });
       }
     }
 
+    // LEGACY SYSTEM (for content agent and fallbacks)
     // Utilities for extraction load/save
     async function loadExtraction(docId) {
       try {
@@ -3816,7 +4349,7 @@ Document: {{media url=dataUri}}`,
     // If explicitly asking for linked docs and we have a focus doc, show its relationships immediately
     if (wantsLinkedEarly && focusDocId) {
       // Update mode to reflect linked agent
-      send('mode', { mode: 'linked', intent: decision.intent, confidence: decision.confidence });
+      send('mode', { mode: 'linked', intent: 'Linked', confidence: routingResult.confidence });
       const { data: focus } = await db
         .from('documents')
         .select('id, title, filename, version_group_id, is_current_version')
@@ -3885,7 +4418,7 @@ Document: {{media url=dataUri}}`,
     // Focused Content Q&A — if router chose ContentQA, answer using the current focus doc (citations/ordinal)
     if (primary === 'content') {
       // Update mode to reflect content agent
-      send('mode', { mode: 'content', intent: decision.intent, confidence: decision.confidence });
+      send('mode', { mode: 'content', intent: 'ContentQA', confidence: routingResult.confidence });
       // Resolve target doc id
       let targetId = focusDocId || null;
       const ord = (decision?.target?.ordinal ? Number(decision.target.ordinal) : null) || ordinalFromQuestionEarly(question);
@@ -5100,11 +5633,12 @@ Document: {{media url=dataUri}}`,
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-    // Document stats - filter by department for non-admins
+    // Document stats - filter by department for non-admins and exclude folder placeholders
     let docQuery = db
       .from('documents')
       .select('id, file_size_bytes, type, uploaded_at, owner_user_id, department_id')
-      .eq('org_id', orgId);
+      .eq('org_id', orgId)
+      .neq('type', 'folder'); // Exclude folder placeholder documents
 
     if (!isOrgAdmin) {
       if (userDepartments.length > 0) {
@@ -5181,6 +5715,7 @@ Document: {{media url=dataUri}}`,
           .from('documents')
           .select('id')
           .eq('org_id', orgId)
+          .neq('type', 'folder') // Exclude folder placeholders
           .in('department_id', userDepartments);
         allowedDocIds = (docIdsRows || []).map(r => r.id);
       }
@@ -5349,6 +5884,73 @@ Document: {{media url=dataUri}}`,
       app.log.error(error, 'File serving error');
       return reply.code(500).send({ error: 'Failed to serve file' });
     }
+  });
+
+  // Department Categories Management
+  // GET /orgs/:orgId/departments/:deptId/categories - Get categories for a department
+  app.get('/orgs/:orgId/departments/:deptId/categories', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = req.params.orgId;
+    const deptId = req.params.deptId;
+    const userId = req.user.id;
+
+    // Verify user has access to this org and department
+    await ensureActiveMember(req);
+    
+    const { data, error } = await db
+      .from('departments')
+      .select('categories')
+      .eq('org_id', orgId)
+      .eq('id', deptId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return { categories: ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'] };
+      }
+      throw error;
+    }
+
+    return { 
+      categories: data?.categories || ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence']
+    };
+  });
+
+  // PUT /orgs/:orgId/departments/:deptId/categories - Update categories for a department (Admin only)
+  app.put('/orgs/:orgId/departments/:deptId/categories', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = req.params.orgId;
+    const deptId = req.params.deptId;
+    const userId = req.user.id;
+    const isAdmin = req.user.role === 'systemAdmin';
+
+    // Only admins can update categories
+    if (!isAdmin) {
+      const err = new Error('Only administrators can manage department categories');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    await ensureActiveMember(req);
+
+    const Schema = z.object({
+      categories: z.array(z.string().min(1)).min(1).max(50)
+    });
+    
+    const { categories } = Schema.parse(req.body || {});
+
+    const { data, error } = await db
+      .from('departments')
+      .update({ categories })
+      .eq('org_id', orgId)
+      .eq('id', deptId)
+      .select('id, name, categories')
+      .single();
+
+    if (error) throw error;
+
+    console.log(`📂 Categories updated for department ${data.name}:`, categories);
+    return data;
   });
 
   // Register all route modules (dashboard, future modules, etc.)
