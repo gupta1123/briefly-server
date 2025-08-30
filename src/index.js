@@ -17,7 +17,8 @@ async function main() {
     origin: [
       'https://brieflydocs.netlify.app',
       'http://localhost:3000',
-      'http://localhost:3001'
+      'http://localhost:3001',
+      'http://localhost:9002'
     ], 
     credentials: true 
   });
