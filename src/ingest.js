@@ -54,6 +54,12 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
       orgSummaryPrompt = priv.summary_prompt;
     }
   } catch {}
+  try {
+    if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
+      const preview = String(orgSummaryPrompt).slice(0, 120).replace(/\n/g, ' ');
+      app.log.info({ orgId, docId, promptPreview: preview }, 'Ingest: using org summary prompt');
+    }
+  } catch {}
 
   // 2) Extract OCR + metadata via Gemini (Genkit)
   // Return page-aware OCR: an array of pages with text, when possible. Fallback to whole text.
@@ -115,6 +121,11 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
       documentDate: meta?.documentDate,
       category: meta?.category,
     };
+    try {
+      if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
+        app.log.info({ orgId, docId, summaryLen: (summaryText || '').length }, 'Ingest: summary generated');
+      }
+    } catch {}
   } catch (e) {
     log.warn(e, 'ingest: gemini extraction failed, continuing');
     try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, type: 'ingest.error', doc_id: docId, note: String(e?.message || e) }); } catch {}

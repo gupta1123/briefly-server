@@ -2514,8 +2514,10 @@ export function registerRoutes(app) {
     const userId = req.user?.sub;
     const { id } = req.params;
     const { permanent } = req.query || {};
+    // Require delete permission (business-level check) and then perform write with service role to avoid RLS WITH CHECK failures
+    await ensurePerm(req, 'documents.delete');
 
-    const { data: document, error: fetchError } = await db
+    const { data: document, error: fetchError } = await app.supabaseAdmin
       .from('documents')
       .select('id, org_id, storage_key, title, filename')
       .eq('org_id', orgId)
@@ -2533,7 +2535,7 @@ export function registerRoutes(app) {
     if (!doPermanent) {
       const now = new Date();
       const purgeAfter = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-      const { error: updErr } = await db
+      const { error: updErr } = await app.supabaseAdmin
         .from('documents')
         .update({ deleted_at: now.toISOString(), deleted_by: userId, purge_after: purgeAfter.toISOString() })
         .eq('org_id', orgId)
@@ -2625,9 +2627,15 @@ export function registerRoutes(app) {
     const userId = req.user?.sub;
     const Schema = z.object({ ids: z.array(z.string()).min(1).max(100) }); // Limit to 100 documents
     const { ids } = Schema.parse(req.body);
+    // Require bulk delete permission (or at least delete)
+    try {
+      await ensurePerm(req, 'documents.bulk_delete');
+    } catch {
+      await ensurePerm(req, 'documents.delete');
+    }
     
     // Get all documents to retrieve storage information
-    const { data: documents, error: fetchError } = await db
+    const { data: documents, error: fetchError } = await app.supabaseAdmin
       .from('documents')
       .select('id, storage_key, title, filename')
       .eq('org_id', orgId)
@@ -2644,7 +2652,7 @@ export function registerRoutes(app) {
     }
     
     // Delete from database in bulk
-    const { error: dbError } = await db.from('documents').delete().eq('org_id', orgId).in('id', ids);
+    const { error: dbError } = await app.supabaseAdmin.from('documents').delete().eq('org_id', orgId).in('id', ids);
     if (dbError) throw dbError;
     
     // Clean up storage files in parallel (non-blocking)
@@ -3843,6 +3851,12 @@ export function registerRoutes(app) {
         .maybeSingle();
       if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') orgSummaryPrompt = priv.summary_prompt;
     } catch {}
+    try {
+      if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
+        const preview = String(orgSummaryPrompt).slice(0, 120).replace(/\n/g, ' ');
+        app.log.info({ orgId, promptPreview: preview }, 'Analyze: using org summary prompt');
+      }
+    } catch {}
 
     const { data: fileBlob, error: dlErr } = await app.supabaseAdmin.storage.from('documents').download(storageKey);
     if (dlErr || !fileBlob) return reply.code(400).send({ error: 'Unable to download storage object' });
@@ -3972,6 +3986,11 @@ Document: {{media url=dataUri}}`,
     ]);
 
     const [{ output: ocr }, { output: meta }, { output: sum }] = [ocrResult, metaResult, sumResult];
+    try {
+      if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
+        app.log.info({ orgId, storageKey, summaryLen: (sum?.summary || '').length }, 'Analyze: summary generated');
+      }
+    } catch {}
 
     // Post-process to guarantee required fields
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
@@ -4748,11 +4767,21 @@ Document: {{media url=dataUri}}`,
           if (ex?.metadata?.summary) summaryText = String(ex.metadata.summary);
           else if ((ex?.ocrText || '').trim().length > 0) {
             try {
+              // Use org-specific summary prompt if available
+              let orgSummaryPrompt = 'Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.';
+              try {
+                const { data: priv } = await app.supabaseAdmin
+                  .from('org_private_settings')
+                  .select('summary_prompt')
+                  .eq('org_id', orgId)
+                  .maybeSingle();
+                if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') orgSummaryPrompt = priv.summary_prompt;
+              } catch {}
               const summarizePrompt = ai.definePrompt({
                 name: 'docSummaryMetadataOnly',
                 input: { schema: z.object({ text: z.string() }) },
                 output: { schema: z.object({ summary: z.string() }) },
-                prompt: `Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.\n\nText:\n{{text}}`,
+                prompt: `${orgSummaryPrompt}\n\nText:\n{{text}}`,
               });
               const { output } = await summarizePrompt({ text: ex.ocrText.slice(0, 12000) });
               summaryText = output?.summary || '';
@@ -5409,11 +5438,21 @@ Document: {{media url=dataUri}}`,
           if (ex?.metadata?.summary) summaryText = String(ex.metadata.summary);
           else if ((ex?.ocrText || '').trim().length > 0) {
             try {
+              // Use org-specific summary prompt if available
+              let orgSummaryPrompt = 'Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.';
+              try {
+                const { data: priv } = await app.supabaseAdmin
+                  .from('org_private_settings')
+                  .select('summary_prompt')
+                  .eq('org_id', orgId)
+                  .maybeSingle();
+                if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') orgSummaryPrompt = priv.summary_prompt;
+              } catch {}
               const summarizePrompt = ai.definePrompt({
                 name: 'docSummaryMetadataOnly',
                 input: { schema: z.object({ text: z.string() }) },
                 output: { schema: z.object({ summary: z.string() }) },
-                prompt: `Summarize the following document text in 3-6 short bullet points (<= 220 words total).\nAvoid hallucinations and use only given text.\n\nText:\n{{text}}`,
+                prompt: `${orgSummaryPrompt}\n\nText:\n{{text}}`,
               });
               const { output } = await summarizePrompt({ text: ex.ocrText.slice(0, 12000) });
               summaryText = output?.summary || '';
@@ -6028,7 +6067,6 @@ Document: {{media url=dataUri}}`,
 
   // Recycle Bin APIs
   app.get('/orgs/:orgId/recycle-bin', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
-    const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const perms = await getMyPermissions(req, orgId);
     const canAdmin = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
@@ -6038,12 +6076,13 @@ Document: {{media url=dataUri}}`,
       throw err;
     }
     const nowIso = new Date().toISOString();
-    const { data, error } = await db
+    const { data, error } = await app.supabaseAdmin
       .from('documents')
       .select('*')
       .eq('org_id', orgId)
       .not('deleted_at', 'is', null)
-      .gt('purge_after', nowIso);
+      .gt('purge_after', nowIso)
+      .order('deleted_at', { ascending: false });
     if (error) throw error;
     return (data || []).map(mapDbToFrontendFields);
   });
@@ -6115,7 +6154,7 @@ Document: {{media url=dataUri}}`,
     }
     const nowIso = new Date().toISOString();
     // Fetch candidates
-    const { data: victims } = await req.supabase
+    const { data: victims } = await app.supabaseAdmin
       .from('documents')
       .select('id, storage_key')
       .eq('org_id', orgId)
