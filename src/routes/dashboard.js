@@ -261,13 +261,14 @@ export function registerDashboardRoutes(app) {
             
             // Also insert into app_users table for future use
             try {
-              await db
+              // Use service role to upsert cross-user profiles (bypass self-only RLS)
+              await app.supabaseAdmin
                 .from('app_users')
                 .upsert({ 
                   id: userId, 
                   display_name: resolvedName
                 });
-              console.log(`✅ [TEAM_LEAD_DASHBOARD] Inserted display name into app_users: ${userId} -> ${resolvedName}`);
+              console.log(`✅ [TEAM_LEAD_DASHBOARD] Inserted display name into app_users (admin): ${userId} -> ${resolvedName}`);
             } catch (insertError) {
               console.log(`⚠️ [TEAM_LEAD_DASHBOARD] Could not insert into app_users:`, insertError.message);
             }

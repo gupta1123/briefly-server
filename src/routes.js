@@ -214,9 +214,76 @@ async function getMyPermissions(req, orgId) {
   return roleRow?.permissions || {};
 }
 
-async function ensurePerm(req, permKey) {
+// Merge role permissions with per-user overrides (org-wide and optional dept-specific)
+async function getEffectivePermissions(req, orgId, opts = {}) {
+  const db = req.supabase;
+  const userId = req.user?.sub;
+  const deptId = Object.prototype.hasOwnProperty.call(opts, 'departmentId') ? opts.departmentId : undefined;
+
+  // 1) user role in org
+  const { data: membership, error: memErr } = await db
+    .from('organization_users')
+    .select('role, expires_at')
+    .eq('org_id', orgId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (memErr) throw memErr;
+  if (!membership || (membership.expires_at && new Date(membership.expires_at).getTime() <= Date.now())) return {};
+
+  // 2) role permissions
+  let rolePerms = {};
+  if (membership.role) {
+    const { data: roleRow } = await db
+      .from('org_roles')
+      .select('permissions')
+      .eq('org_id', orgId)
+      .eq('key', membership.role)
+      .maybeSingle();
+    rolePerms = roleRow?.permissions || {};
+  }
+
+  // 3) org-wide override
+  const { data: orgOverrideRow } = await db
+    .from('user_access_overrides')
+    .select('permissions')
+    .eq('org_id', orgId)
+    .eq('user_id', userId)
+    .is('department_id', null)
+    .maybeSingle();
+  const orgOverride = orgOverrideRow?.permissions || {};
+
+  // 4) dept-specific override (only if explicit dept requested)
+  let deptOverride = {};
+  if (typeof deptId === 'string') {
+    const { data: deptOverrideRow } = await db
+      .from('user_access_overrides')
+      .select('permissions')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .eq('department_id', deptId)
+      .maybeSingle();
+    deptOverride = deptOverrideRow?.permissions || {};
+  }
+
+  const keys = new Set([
+    ...Object.keys(rolePerms || {}),
+    ...Object.keys(orgOverride || {}),
+    ...Object.keys(deptOverride || {}),
+  ]);
+  const effective = {};
+  for (const k of keys) {
+    effective[k] = Object.prototype.hasOwnProperty.call(deptOverride, k)
+      ? !!deptOverride[k]
+      : Object.prototype.hasOwnProperty.call(orgOverride, k)
+        ? !!orgOverride[k]
+        : !!rolePerms[k];
+  }
+  return effective;
+}
+
+async function ensurePerm(req, permKey, opts = {}) {
   const orgId = requireOrg(req);
-  const perms = await getMyPermissions(req, orgId);
+  const perms = await getEffectivePermissions(req, orgId, opts);
   if (!perms || perms[permKey] !== true) {
     const err = new Error('Forbidden');
     err.statusCode = 403;
@@ -1961,7 +2028,7 @@ export function registerRoutes(app) {
     return enriched;
   });
 
-  app.get('/orgs/:orgId/documents', { preHandler: app.verifyAuth }, async (req) => {
+  app.get('/orgs/:orgId/documents', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     console.log('Documents endpoint called for org:', req.params.orgId, 'user:', req.user?.sub, 'query:', req.query);
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
@@ -2222,6 +2289,7 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
+    console.log('[DOCS.CREATE] user', userId, 'org', orgId, 'payload keys', Object.keys(req.body || {}));
     const Schema = z.object({
       title: z.string().min(1),
       filename: z.string().min(1),
@@ -2257,6 +2325,7 @@ export function registerRoutes(app) {
         .eq('org_id', orgId)
         .eq('user_id', userId);
       const uniq = Array.from(new Set((myDepts || []).map(r => r.department_id)));
+      console.log('[DOCS.CREATE] non-admin dept memberships:', uniq);
       if (departmentId) {
         if (!uniq.includes(departmentId)) {
           const err = new Error('You can only create documents for your own team');
@@ -2267,7 +2336,7 @@ export function registerRoutes(app) {
         if (body.folderPath && Array.isArray(body.folderPath) && body.folderPath.length > 0) {
           try {
             // Find the parent folder by traversing up the path
-            let parentPath = body.folderPath.slice(0, -1); // Remove the filename part
+            let parentPath = body.folderPath.slice(); // folderPath already represents the containing folder path
             while (parentPath.length > 0) {
               const { data: parentFolder } = await db
                 .from('documents')
@@ -2291,7 +2360,7 @@ export function registerRoutes(app) {
             console.error('❌ [NON-ADMIN] Error inheriting department from parent folder:', error);
           }
           if (!departmentId) {
-            console.log(`ℹ️ [NON-ADMIN] No department inherited from folder path: ${body.folderPath.slice(0, -1).join('/')}`);
+            console.log(`ℹ️ [NON-ADMIN] No department inherited from folder path: ${body.folderPath.join('/')}`);
           }
         }
 
@@ -2311,7 +2380,7 @@ export function registerRoutes(app) {
         if (body.folderPath && Array.isArray(body.folderPath) && body.folderPath.length > 0) {
           try {
             // Find the parent folder by traversing up the path
-            let parentPath = body.folderPath.slice(0, -1); // Remove the filename part
+            let parentPath = body.folderPath.slice(); // folderPath already represents the containing folder path
             while (parentPath.length > 0) {
               const { data: parentFolder } = await db
                 .from('documents')
@@ -2333,7 +2402,7 @@ export function registerRoutes(app) {
             console.error('❌ [ADMIN] Error inheriting department from parent folder:', error);
           }
           if (!departmentId) {
-            console.log(`ℹ️ [ADMIN] No department inherited from folder path: ${body.folderPath.slice(0, -1).join('/')}`);
+            console.log(`ℹ️ [ADMIN] No department inherited from folder path: ${body.folderPath.join('/')}`);
           }
         }
 
@@ -2356,6 +2425,26 @@ export function registerRoutes(app) {
           }
         }
       }
+    }
+    // Debug RLS pre-checks (membership, permission, dept membership)
+    try {
+      const { data: okMember } = await db.rpc('is_member_of', { p_org_id: orgId });
+      const { data: okPerm } = await db.rpc('has_perm', { p_org_id: orgId, p_perm: 'documents.create' });
+      let okDept = null;
+      if (departmentId) {
+        const { data } = await db.rpc('is_dept_member', { target_org_id: orgId, target_dept_id: departmentId });
+        okDept = data;
+      }
+      console.log('[DOCS.CREATE] RLS precheck is_member_of:', okMember, 'has_perm(documents.create):', okPerm, 'is_dept_member:', okDept);
+    } catch (e) {
+      console.warn('[DOCS.CREATE] RLS precheck error', e?.message || e);
+    }
+    // Log effective permissions snapshot for debugging
+    try {
+      const perms = await getEffectivePermissions(req, orgId, { departmentId });
+      console.log('[DOCS.CREATE] effective perms for user', userId, 'dept', departmentId, perms);
+    } catch (e) {
+      console.warn('[DOCS.CREATE] failed to compute effective perms', e?.message);
     }
     console.log('Backend document creation - body.folderPath:', body.folderPath, 'Type:', typeof body.folderPath, 'Is Array:', Array.isArray(body.folderPath));
     console.log('Backend document creation - dbFields.folder_path:', dbFields.folder_path, 'Type:', typeof dbFields.folder_path, 'Is Array:', Array.isArray(dbFields.folder_path));
@@ -2424,64 +2513,43 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
     const { id } = req.params;
-    
-    // First, get the document to retrieve storage information
+    const { permanent } = req.query || {};
+
     const { data: document, error: fetchError } = await db
       .from('documents')
-      .select('storage_key, title, filename')
+      .select('id, org_id, storage_key, title, filename')
       .eq('org_id', orgId)
       .eq('id', id)
-      .single();
-      
-    if (fetchError) {
-      if (fetchError.code === 'PGRST116') {
-        // Document not found
-        const err = new Error('Document not found');
-        err.statusCode = 404;
-        throw err;
-      }
-      throw fetchError;
+      .maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!document) {
+      const err = new Error('Document not found');
+      err.statusCode = 404;
+      throw err;
     }
-    
-    // Delete from database first
-    const { error: dbError } = await db.from('documents').delete().eq('org_id', orgId).eq('id', id);
-    if (dbError) throw dbError;
-    
-    // Clean up storage files if they exist
-    const cleanupTasks = [];
-    
-    // 1. Delete main document file from storage
+
+    const doPermanent = String(permanent || '').toLowerCase() === '1' || String(permanent || '').toLowerCase() === 'true';
+
+    if (!doPermanent) {
+      const now = new Date();
+      const purgeAfter = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const { error: updErr } = await db
+        .from('documents')
+        .update({ deleted_at: now.toISOString(), deleted_by: userId, purge_after: purgeAfter.toISOString() })
+        .eq('org_id', orgId)
+        .eq('id', id);
+      if (updErr) throw updErr;
+      await logAudit(app, orgId, userId, 'delete', { doc_id: id, note: 'moved to recycle bin' });
+      return { ok: true, storage_cleaned: false, trashed: true, purge_after: purgeAfter.toISOString() };
+    }
+
     if (document.storage_key) {
-      cleanupTasks.push(
-        app.supabaseAdmin.storage
-          .from('documents')
-          .remove([document.storage_key])
-          .catch(error => console.warn(`Failed to delete document file ${document.storage_key}:`, error))
-      );
+      try { await app.supabaseAdmin.storage.from('documents').remove([document.storage_key]); } catch (e) { req.log.error(e, 'storage delete failed'); }
+      try { await app.supabaseAdmin.storage.from('extractions').remove([`${orgId}/${id}.json`]); } catch {}
     }
-    
-    // 2. Delete extraction data from storage
-    const extractionKey = `${orgId}/${id}.json`;
-    cleanupTasks.push(
-      app.supabaseAdmin.storage
-        .from('extractions')
-        .remove([extractionKey])
-        .catch(error => console.warn(`Failed to delete extraction data ${extractionKey}:`, error))
-    );
-    
-    // Execute all cleanup tasks in parallel (non-blocking)
-    Promise.all(cleanupTasks).catch(error => 
-      console.error(`Storage cleanup failed for document ${id}:`, error)
-    );
-    
-    // Log the deletion
-    await logAudit(app, orgId, userId, 'delete', { 
-      doc_id: id, 
-      note: `deleted "${document.title || document.filename || 'untitled'}"`,
-      storage_cleaned: !!document.storage_key
-    });
-    
-    return { ok: true, storage_cleaned: !!document.storage_key };
+    await app.supabaseAdmin.from('documents').delete().eq('org_id', orgId).eq('id', id);
+    await logAudit(app, orgId, userId, 'delete', { doc_id: id, note: `permanently deleted "${document.title || document.filename || 'untitled'}"`, storage_cleaned: !!document.storage_key });
+    return { ok: true, storage_cleaned: !!document.storage_key, trashed: false, permanent: true };
   });
 
   // Reingest a document: rerun OCR/metadata/chunks/embeddings
@@ -2528,7 +2596,7 @@ export function registerRoutes(app) {
   });
 
   // Ingest status for a document
-  app.get('/orgs/:orgId/documents/:id/ingest', { preHandler: app.verifyAuth }, async (req) => {
+  app.get('/orgs/:orgId/documents/:id/ingest', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
@@ -2624,7 +2692,7 @@ export function registerRoutes(app) {
     };
   });
 
-  app.post('/orgs/:orgId/documents/move', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/move', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -2636,7 +2704,7 @@ export function registerRoutes(app) {
     return { moved: (data || []).length };
   });
 
-  app.post('/orgs/:orgId/documents/:id/link', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/:id/link', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -2677,7 +2745,7 @@ export function registerRoutes(app) {
     return { ok: true };
   });
 
-  app.delete('/orgs/:orgId/documents/:id/link/:linkedId', { preHandler: app.verifyAuth }, async (req) => {
+  app.delete('/orgs/:orgId/documents/:id/link/:linkedId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -2697,7 +2765,7 @@ export function registerRoutes(app) {
   });
 
   // Get all relationships for a document (bidirectional + version aware)
-  app.get('/orgs/:orgId/documents/:id/relationships', { preHandler: app.verifyAuth }, async (req) => {
+  app.get('/orgs/:orgId/documents/:id/relationships', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
@@ -2831,7 +2899,7 @@ export function registerRoutes(app) {
   });
 
   // Smart link suggestions based on content similarity
-  app.get('/orgs/:orgId/documents/:id/suggest-links', { preHandler: app.verifyAuth }, async (req) => {
+  app.get('/orgs/:orgId/documents/:id/suggest-links', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
@@ -2958,7 +3026,7 @@ export function registerRoutes(app) {
     return { suggestions };
   });
 
-  app.post('/orgs/:orgId/documents/:id/version', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/:id/version', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -2986,7 +3054,7 @@ export function registerRoutes(app) {
     return mapDbToFrontendFields(created);
   });
 
-  app.post('/orgs/:orgId/documents/:id/set-current', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/:id/set-current', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -3000,7 +3068,7 @@ export function registerRoutes(app) {
     return { ok: true };
   });
 
-  app.post('/orgs/:orgId/documents/:id/move-version', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/:id/move-version', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -3044,7 +3112,7 @@ export function registerRoutes(app) {
     return { ok: true };
   });
 
-  app.post('/orgs/:orgId/documents/:id/unlink', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/documents/:id/unlink', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
@@ -3954,7 +4022,7 @@ Document: {{media url=dataUri}}`,
   });
 
   // Save extraction (OCR text + metadata) to Storage bucket 'extractions' as JSON
-  app.post('/orgs/:orgId/documents/:id/extraction', { preHandler: app.verifyAuth }, async (req, reply) => {
+  app.post('/orgs/:orgId/documents/:id/extraction', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
     // Require edit permission (doc-level RLS will further restrict)
     try {
@@ -4022,7 +4090,7 @@ Document: {{media url=dataUri}}`,
   });
 
   // Load extraction JSON from Storage
-  app.get('/orgs/:orgId/documents/:id/extraction', { preHandler: app.verifyAuth }, async (req, reply) => {
+  app.get('/orgs/:orgId/documents/:id/extraction', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
     // Verify caller can read the document via RLS before downloading extraction
@@ -5917,7 +5985,7 @@ Document: {{media url=dataUri}}`,
   });
 
   // File serving endpoint for secure document preview
-  app.get('/orgs/:orgId/documents/:id/file', { preHandler: app.verifyAuth }, async (req, reply) => {
+  app.get('/orgs/:orgId/documents/:id/file', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req, reply) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { id } = req.params;
@@ -5956,6 +6024,112 @@ Document: {{media url=dataUri}}`,
       app.log.error(error, 'File serving error');
       return reply.code(500).send({ error: 'Failed to serve file' });
     }
+  });
+
+  // Recycle Bin APIs
+  app.get('/orgs/:orgId/recycle-bin', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const perms = await getMyPermissions(req, orgId);
+    const canAdmin = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
+    if (!canAdmin) {
+      const err = new Error('Forbidden');
+      err.statusCode = 403;
+      throw err;
+    }
+    const nowIso = new Date().toISOString();
+    const { data, error } = await db
+      .from('documents')
+      .select('*')
+      .eq('org_id', orgId)
+      .not('deleted_at', 'is', null)
+      .gt('purge_after', nowIso);
+    if (error) throw error;
+    return (data || []).map(mapDbToFrontendFields);
+  });
+
+  app.post('/orgs/:orgId/documents/:id/trash', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'documents.delete');
+    const { id } = req.params;
+    const userId = req.user?.sub;
+    const now = new Date();
+    const purgeAfter = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const { data, error } = await app.supabaseAdmin
+      .from('documents')
+      .update({ deleted_at: now.toISOString(), deleted_by: userId, purge_after: purgeAfter.toISOString() })
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: userId, type: 'documents.trash', doc_id: id }); } catch {}
+    return mapDbToFrontendFields(data);
+  });
+
+  app.post('/orgs/:orgId/documents/:id/restore', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'documents.update');
+    const { id } = req.params;
+    const { data, error } = await app.supabaseAdmin
+      .from('documents')
+      .update({ deleted_at: null, deleted_by: null, purge_after: null })
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: req.user?.sub, type: 'documents.restore', doc_id: id }); } catch {}
+    return mapDbToFrontendFields(data);
+  });
+
+  app.delete('/orgs/:orgId/documents/:id/permanent', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'documents.delete');
+    const { id } = req.params;
+    // Fetch doc for storage
+    const { data: doc } = await app.supabaseAdmin
+      .from('documents')
+      .select('id, org_id, storage_key')
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .single();
+    if (doc?.storage_key) {
+      try { await app.supabaseAdmin.storage.from('documents').remove([doc.storage_key]); } catch (e) { req.log.error(e, 'storage delete failed'); }
+    }
+    try { await app.supabaseAdmin.storage.from('extractions').remove([`${orgId}/${id}.json`]); } catch {}
+    await app.supabaseAdmin.from('documents').delete().eq('org_id', orgId).eq('id', id);
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: req.user?.sub, type: 'documents.delete.permanent', doc_id: id }); } catch {}
+    return { ok: true };
+  });
+
+  // Purge all expired trashed documents (admin-only)
+  app.post('/orgs/:orgId/recycle-bin/purge', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    const perms = await getMyPermissions(req, orgId);
+    const canAdmin = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
+    if (!canAdmin) {
+      const err = new Error('Forbidden');
+      err.statusCode = 403;
+      throw err;
+    }
+    const nowIso = new Date().toISOString();
+    // Fetch candidates
+    const { data: victims } = await req.supabase
+      .from('documents')
+      .select('id, storage_key')
+      .eq('org_id', orgId)
+      .not('deleted_at', 'is', null)
+      .lte('purge_after', nowIso);
+    for (const v of victims || []) {
+      try {
+        if (v.storage_key) await app.supabaseAdmin.storage.from('documents').remove([v.storage_key]);
+        try { await app.supabaseAdmin.storage.from('extractions').remove([`${orgId}/${v.id}.json`]); } catch {}
+      } catch {}
+      await app.supabaseAdmin.from('documents').delete().eq('org_id', orgId).eq('id', v.id);
+      try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: req.user?.sub, type: 'documents.purge', doc_id: v.id }); } catch {}
+    }
+    return { purged: (victims || []).length };
   });
 
   // Department Categories Management

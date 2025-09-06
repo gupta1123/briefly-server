@@ -95,6 +95,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
     };
   } catch (e) {
     log.warn(e, 'ingest: gemini extraction failed, continuing');
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, type: 'ingest.error', doc_id: docId, note: String(e?.message || e) }); } catch {}
   }
 
   // Persist extraction JSON
@@ -111,6 +112,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
     await app.supabaseAdmin.storage.from('extractions').upload(key, Buffer.from(payload), { contentType: 'application/json', upsert: true });
   } catch (e) {
     log.warn(e, 'ingest: persist extraction failed');
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, type: 'ingest.error', doc_id: docId, note: 'persist extraction failed' }); } catch {}
   }
 
   // Update document metadata only if blank (avoid stomping later edits)
@@ -140,6 +142,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
     }
   } catch (e) {
     log.warn(e, 'ingest: update doc metadata failed');
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, type: 'ingest.error', doc_id: docId, note: 'update metadata failed' }); } catch {}
   }
 
   // 3) Chunk text
@@ -168,6 +171,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
     }
   } catch (e) {
     log.warn(e, 'ingest: embeddings or write failed');
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, type: 'ingest.error', doc_id: docId, note: 'embeddings/write failed' }); } catch {}
   }
 
   log.info({ orgId, docId, chunks: chunks.length }, 'ingest complete');
