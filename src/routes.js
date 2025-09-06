@@ -3836,7 +3836,7 @@ export function registerRoutes(app) {
     // Per-org summary prompt
     let orgSummaryPrompt = 'Write a concise summary (<= 300 words) of the document text. Focus on essential facts and outcomes.';
     try {
-      const { data: priv } = await req.supabase
+      const { data: priv } = await app.supabaseAdmin
         .from('org_private_settings')
         .select('summary_prompt')
         .eq('org_id', orgId)

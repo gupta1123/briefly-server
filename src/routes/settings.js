@@ -178,12 +178,12 @@ export function registerSettingsRoutes(app) {
   // --- Org Private Settings: Summary Prompt ---
   // Admin-only: Read current organization's private settings (e.g., AI summary prompt)
   app.get('/orgs/:orgId/private-settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
+    const admin = app.supabaseAdmin;
     const orgId = await ensureActiveMember(req);
     // Restrict to admins who can update org settings
     await ensurePerm(req, 'org.update_settings');
 
-    const { data, error } = await db
+    const { data, error } = await admin
       .from('org_private_settings')
       .select('org_id, summary_prompt, created_at, updated_at')
       .eq('org_id', orgId)
@@ -200,7 +200,7 @@ export function registerSettingsRoutes(app) {
 
   // Admin-only: Update/create the org's private settings (summary prompt)
   app.put('/orgs/:orgId/private-settings', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
+    const admin = app.supabaseAdmin;
     const orgId = await ensureActiveMember(req);
     await ensurePerm(req, 'org.update_settings');
 
@@ -209,7 +209,7 @@ export function registerSettingsRoutes(app) {
     });
     const body = Schema.parse(req.body || {});
     const payload = { org_id: orgId, summary_prompt: body.summary_prompt };
-    const { data, error } = await db
+    const { data, error } = await admin
       .from('org_private_settings')
       .upsert(payload, { onConflict: 'org_id' })
       .select('org_id, summary_prompt, created_at, updated_at')
