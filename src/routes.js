@@ -3833,6 +3833,17 @@ export function registerRoutes(app) {
       .maybeSingle();
     const availableCategories = orgSettings?.categories || ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'];
 
+    // Per-org summary prompt
+    let orgSummaryPrompt = 'Write a concise summary (<= 300 words) of the document text. Focus on essential facts and outcomes.';
+    try {
+      const { data: priv } = await req.supabase
+        .from('org_private_settings')
+        .select('summary_prompt')
+        .eq('org_id', orgId)
+        .maybeSingle();
+      if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') orgSummaryPrompt = priv.summary_prompt;
+    } catch {}
+
     const { data: fileBlob, error: dlErr } = await app.supabaseAdmin.storage.from('documents').download(storageKey);
     if (dlErr || !fileBlob) return reply.code(400).send({ error: 'Unable to download storage object' });
 
@@ -3921,7 +3932,6 @@ export function registerRoutes(app) {
       input: { schema: z.object({ dataUri: z.string() }) },
       output: {
         schema: z.object({
-          summary: z.string().optional(),
           keywords: z.array(z.string()).min(3),
           title: z.string().min(1),
           subject: z.string().min(1),
@@ -3934,44 +3944,34 @@ export function registerRoutes(app) {
           tags: z.array(z.string()).min(3),
         }),
       },
-      prompt: `You are an expert document summarizer and information extractor.
+      prompt: `You are an expert document information extractor.
 
-You will receive a document in various formats (PDF, PNG, JPG, DOCX, TXT, MD). Your task is to:
+1. Identify the subject of the document.
+2. Identify the date the document was sent. If you cannot find one, leave it blank.
+3. Identify all distinct pairs of sender and receiver in the document. Provide primary sender/receiver and list all options.
+4. Extract keywords from the document (minimum 3).
+5. Categorize the document into one of the following: ${availableCategories.join(', ')}.
+6. Generate 3-8 relevant tags and a concise title.
 
-1. Create a concise summary of the document, no more than 300 words, in English.
-2. Identify the subject of the document.
-3. Identify the date the document was sent. If you cannot find one, leave it blank.
-4. Identify all distinct pairs of sender and receiver in the document. For each pair, provide the sender and the receiver.
-5. Extract keywords from the document.
-6. Categorize the document into one of the following categories: ${availableCategories.join(', ')}. Choose the single most appropriate category.
-
-Even if the document is in another language, you must provide the summary, subject, date, sender/receiver pairs, keywords, and category in English.
-
-Consider the entire document, including any tables, images, and handwritten text. If there are multiple distinct sender/receiver pairs, identify each one.
-
-IMPORTANT OUTPUT REQUIREMENTS:
-- summary: Use the summary from step 1 (max 300 words)
-- subject: Use the subject from step 2
-- documentDate: Use the date from step 3
-- sender: Use the primary sender from step 4
-- receiver: Use the primary receiver from step 4
-- senderOptions: Array of all senders found in step 4
-- receiverOptions: Array of all receivers found in step 4
-- keywords: Use keywords from step 5 (minimum 3)
-- category: Use category from step 6
-- tags: Generate 3-8 relevant tags based on document content
-- title: Generate a concise title based on subject and content
+Do NOT include a summary in this response.
 
 Document: {{media url=dataUri}}`,
     });
+    const summaryPrompt = ai.definePrompt({
+      name: 'summaryPrompt',
+      input: { schema: z.object({ dataUri: z.string() }) },
+      output: { schema: z.object({ summary: z.string() }) },
+      prompt: `${orgSummaryPrompt}\n\n{{media url=dataUri}}`,
+    });
 
     // Process with reliable approach
-    const [ocrResult, metaResult] = await Promise.all([
+    const [ocrResult, metaResult, sumResult] = await Promise.all([
       ocrPrompt({ dataUri }),
       metaPrompt({ dataUri }),
+      summaryPrompt({ dataUri }),
     ]);
 
-    const [{ output: ocr }, { output: meta }] = [ocrResult, metaResult];
+    const [{ output: ocr }, { output: meta }, { output: sum }] = [ocrResult, metaResult, sumResult];
 
     // Post-process to guarantee required fields
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
@@ -3980,7 +3980,7 @@ Document: {{media url=dataUri}}`,
       subject: (meta?.subject || baseName),
       keywords: Array.from(new Set(((meta?.keywords || []).filter(Boolean).slice(0,10)).concat([baseName]))).slice(0, 10),
       tags: Array.from(new Set(((meta?.tags || []).filter(Boolean).slice(0,8)).concat(['document']))).slice(0, 8),
-      summary: meta?.summary || '',
+      summary: (sum && typeof sum.summary === 'string') ? sum.summary : '',
       sender: meta?.sender,
       receiver: meta?.receiver,
       senderOptions: meta?.senderOptions || [],

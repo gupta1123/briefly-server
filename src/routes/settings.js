@@ -174,4 +174,52 @@ export function registerSettingsRoutes(app) {
     if (error) throw error;
     return data;
   });
+
+  // --- Org Private Settings: Summary Prompt ---
+  // Admin-only: Read current organization's private settings (e.g., AI summary prompt)
+  app.get('/orgs/:orgId/private-settings', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    // Restrict to admins who can update org settings
+    await ensurePerm(req, 'org.update_settings');
+
+    const { data, error } = await db
+      .from('org_private_settings')
+      .select('org_id, summary_prompt, created_at, updated_at')
+      .eq('org_id', orgId)
+      .maybeSingle();
+    if (error && error.code !== 'PGRST116') throw error;
+    return (
+      data || {
+        org_id: orgId,
+        summary_prompt:
+          'Write a concise summary (<= 300 words) of the document text. Focus on essential facts and outcomes.',
+      }
+    );
+  });
+
+  // Admin-only: Update/create the org's private settings (summary prompt)
+  app.put('/orgs/:orgId/private-settings', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.update_settings');
+
+    const Schema = z.object({
+      summary_prompt: z.string().min(10).max(3000),
+    });
+    const body = Schema.parse(req.body || {});
+    const payload = { org_id: orgId, summary_prompt: body.summary_prompt };
+    const { data, error } = await db
+      .from('org_private_settings')
+      .upsert(payload, { onConflict: 'org_id' })
+      .select('org_id, summary_prompt, created_at, updated_at')
+      .single();
+    if (error) throw error;
+    try {
+      await app.supabaseAdmin
+        .from('audit_events')
+        .insert({ org_id: orgId, type: 'org.summary_prompt.updated' });
+    } catch {}
+    return data;
+  });
 }

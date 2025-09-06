@@ -42,6 +42,19 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
   const ct = mimeType || fileBlob.type || 'application/octet-stream';
   const dataUri = `data:${ct};base64,${b64}`;
 
+  // Fetch per‑org summary prompt (fallback to default)
+  let orgSummaryPrompt = 'Write a concise summary (<= 300 words) of the document text. Focus on essential facts and outcomes.';
+  try {
+    const { data: priv } = await app.supabaseAdmin
+      .from('org_private_settings')
+      .select('summary_prompt')
+      .eq('org_id', orgId)
+      .maybeSingle();
+    if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') {
+      orgSummaryPrompt = priv.summary_prompt;
+    }
+  } catch {}
+
   // 2) Extract OCR + metadata via Gemini (Genkit)
   // Return page-aware OCR: an array of pages with text, when possible. Fallback to whole text.
   const ocrPrompt = ai.definePrompt({
@@ -55,7 +68,6 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
     input: { schema: z.object({ dataUri: z.string() }) },
     output: {
       schema: z.object({
-        summary: z.string().optional(),
         keywords: z.array(z.string()).min(1).optional(),
         title: z.string().optional(),
         subject: z.string().optional(),
@@ -68,26 +80,36 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType }
         tags: z.array(z.string()).min(1).optional(),
       }),
     },
-    prompt: `You are an expert document summarizer and information extractor.\n\nProvide: summary (<=300 words), subject, primary sender/receiver (+ options), documentDate, keywords (>=3), category (one of: ${availableCategories.join(', ')}), tags (3-8), title.\n\nDocument: {{media url=dataUri}}`,
+    prompt: `You are an expert document information extractor.\n\nProvide: subject, primary sender/receiver (+ options), documentDate, keywords (>=3), category (one of: ${availableCategories.join(', ')}), tags (3-8), title.\nDo not include a summary in this response.\n\nDocument: {{media url=dataUri}}`,
+  });
+  const summaryPrompt = ai.definePrompt({
+    name: 'summaryPrompt',
+    input: { schema: z.object({ dataUri: z.string() }) },
+    output: { schema: z.object({ summary: z.string() }) },
+    // Use org-specific instruction followed by media for the model to read the file
+    prompt: `${orgSummaryPrompt}\n\n{{media url=dataUri}}`,
   });
 
   let ocrText = '';
   let ocrPages = [];
   let metadata = {};
+  let summaryText = '';
   try {
-    const [{ output: ocr }, { output: meta }] = await Promise.all([
+    const [{ output: ocr }, { output: meta }, { output: sum }] = await Promise.all([
       ocrPrompt({ dataUri }),
       metaPrompt({ dataUri }),
+      summaryPrompt({ dataUri }),
     ]);
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
     ocrPages = Array.isArray(ocr?.pages) ? ocr.pages : [];
     ocrText = ocr?.extractedText || (Array.isArray(ocrPages) ? ocrPages.map(p => p.text).join('\n\n') : '');
+    summaryText = (sum && typeof sum.summary === 'string') ? sum.summary : '';
     metadata = {
       title: meta?.title || baseName,
       subject: meta?.subject || baseName,
       keywords: Array.from(new Set(((meta?.keywords || []).filter(Boolean).slice(0,10)).concat([baseName]))).slice(0, 10),
       tags: Array.from(new Set(((meta?.tags || []).filter(Boolean).slice(0,8)).concat(['document']))).slice(0, 8),
-      summary: meta?.summary || '',
+      summary: summaryText,
       sender: meta?.sender,
       receiver: meta?.receiver,
       documentDate: meta?.documentDate,
