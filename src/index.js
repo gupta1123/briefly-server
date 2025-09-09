@@ -203,19 +203,67 @@ async function main() {
   // Invite or add user by email to org (and optional team)
   app.post('/ops/orgs/:orgId/users/invite', { preHandler: [app.verifyAuth, app.requireIpAccess, app.ensurePlatformAdmin] }, async (req) => {
     const { orgId } = req.params;
-    const { email, role = 'member', departmentId, deptRole = 'member' } = req.body || {};
+    const { email, role = 'member', departmentId, deptRole = 'member', password } = req.body || {};
     if (typeof email !== 'string' || !email.includes('@')) { const e = new Error('valid email required'); e.statusCode = 400; throw e; }
-    // Ensure auth user exists
-    let userId = null;
-    try {
-      const { data } = await app.supabaseAdmin.auth.admin.inviteUserByEmail(email);
-      userId = data?.user?.id || null;
-    } catch {
-      try { const { data } = await app.supabaseAdmin.auth.admin.createUser({ email, email_confirm: false }); userId = data?.user?.id || null; } catch {}
+    
+    // Validate password if provided
+    if (password && (typeof password !== 'string' || password.length < 6)) {
+      const e = new Error('password must be at least 6 characters'); e.statusCode = 400; throw e;
     }
+    let userId = null;
+    let userWasCreated = false;
+    
+    if (password && typeof password === 'string' && password.length >= 6) {
+      // Create user with provided password (no email invitation)
+      try {
+        const { data } = await app.supabaseAdmin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true
+        });
+        userId = data?.user?.id || null;
+        userWasCreated = true;
+      } catch (createError) {
+        // If user already exists, try to find and update password
+        try { 
+          const { data: list } = await app.supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 }); 
+          const found = (list?.users || []).find((u) => (u.email || '').toLowerCase() === email.toLowerCase()); 
+          if (found) {
+            userId = found?.id || null;
+            // Update existing user with new password
+            await app.supabaseAdmin.auth.admin.updateUserById(userId, { password, email_confirm: true });
+            userWasCreated = true;
+          }
+        } catch (findError) {
+          console.error('Failed to find/update existing user:', findError);
+          throw createError; // Re-throw original create error
+        }
+      }
+    } else {
+      // Use email invitation flow
+      try {
+        const { data } = await app.supabaseAdmin.auth.admin.inviteUserByEmail(email);
+        userId = data?.user?.id || null;
+      } catch (inviteError) {
+        // Fallback to creating user without password (they'll need to reset)
+        try { 
+          const { data } = await app.supabaseAdmin.auth.admin.createUser({ 
+            email, 
+            email_confirm: false 
+          }); 
+          userId = data?.user?.id || null; 
+        } catch (createError) {
+          console.error('Both invite and create failed:', { inviteError, createError });
+          throw inviteError; // Re-throw invite error as primary
+        }
+      }
+    }
+    
     if (!userId) { const e = new Error('Failed to create/invite user'); e.statusCode = 500; throw e; }
+    
     // Upsert org membership
     await app.supabaseAdmin.from('organization_users').upsert({ org_id: orgId, user_id: userId, role }, { onConflict: 'org_id,user_id' });
+    
     // Optional team membership
     if (departmentId) {
       await app.supabaseAdmin.from('department_users').upsert({ org_id: orgId, department_id: departmentId, user_id: userId, role: deptRole === 'lead' ? 'lead' : 'member' }, { onConflict: 'department_id,user_id' });
@@ -223,8 +271,9 @@ async function main() {
         await app.supabaseAdmin.from('departments').update({ lead_user_id: userId }).eq('org_id', orgId).eq('id', departmentId);
       }
     }
-    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: req.user?.sub, type: 'ops.invite_user', note: `${email} role=${role} dept=${departmentId || ''}` }); } catch {}
-    return { ok: true, userId };
+    
+    try { await app.supabaseAdmin.from('audit_events').insert({ org_id: orgId, actor_user_id: req.user?.sub, type: 'ops.invite_user', note: `${email} role=${role} dept=${departmentId || ''}${userWasCreated ? ' (created_with_password)' : ''}` }); } catch {}
+    return { ok: true, userId, userWasCreated };
   });
 
   // Create team (department) with optional leadEmail
@@ -680,6 +729,43 @@ USING (
     }
     await app.supabaseAdmin.auth.admin.updateUserById(userId, { password: newPassword });
     try { await app.supabaseAdmin.from('audit_events').insert({ type: 'ops.reset_password', actor_user_id: req.user?.sub, note: userId }); } catch {}
+    return { ok: true };
+  });
+
+  // Update user password within org (for team management)
+  app.patch('/ops/orgs/:orgId/users/:userId', { preHandler: [app.verifyAuth, app.requireIpAccess, app.ensurePlatformAdmin] }, async (req) => {
+    const { orgId, userId } = req.params;
+    const { password } = req.body || {};
+    
+    // Validate password
+    if (typeof password !== 'string' || password.length < 6) {
+      const e = new Error('password must be at least 6 characters'); e.statusCode = 400; throw e;
+    }
+    
+    // Ensure user is member of this org
+    const { data: membership } = await app.supabaseAdmin
+      .from('organization_users')
+      .select('user_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    
+    if (!membership) {
+      const e = new Error('User is not a member of this organization'); e.statusCode = 404; throw e;
+    }
+    
+    // Update user's password
+    await app.supabaseAdmin.auth.admin.updateUserById(userId, { password, email_confirm: true });
+    
+    try { 
+      await app.supabaseAdmin.from('audit_events').insert({ 
+        org_id: orgId, 
+        type: 'ops.update_user_password', 
+        actor_user_id: req.user?.sub, 
+        note: userId 
+      }); 
+    } catch {}
+    
     return { ok: true };
   });
 
