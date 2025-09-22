@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { GoogleAIFileManager } from '@google/generative-ai/server';
+import { jsonrepair } from 'jsonrepair';
 
 const API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
 
@@ -36,11 +37,19 @@ export async function deleteGeminiFile(fileId) {
   }
 }
 
-export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, responseMimeType = 'application/json' }) {
+export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, responseMimeType = 'application/json', responseSchema, responseJsonSchema }) {
   if (!genAI) throw new Error('Gemini client not configured');
+  if (responseSchema && responseJsonSchema) {
+    throw new Error('Provide either responseSchema or responseJsonSchema, not both.');
+  }
+
+  const generationConfig = { responseMimeType };
+  if (responseSchema) generationConfig.responseSchema = responseSchema;
+  if (responseJsonSchema) generationConfig.responseJsonSchema = responseJsonSchema;
+
   const model = genAI.getGenerativeModel({
     model: 'models/gemini-1.5-flash',
-    generationConfig: { responseMimeType },
+    generationConfig,
   });
   const result = await model.generateContent([
     { fileData: { fileUri, mimeType } },
@@ -101,6 +110,11 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
       if (Array.isArray(merged) && merged.length > 0) {
         return Object.assign({}, ...merged);
       }
+    } catch {}
+
+    // Last resort: attempt to repair almost-valid JSON before failing.
+    try {
+      return tryParse(jsonrepair(trimmed));
     } catch {}
 
   return null;

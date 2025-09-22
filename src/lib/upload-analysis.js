@@ -1,5 +1,65 @@
 import { uploadBufferToGemini, deleteGeminiFile, generateJsonFromGeminiFile } from './gemini-files.js';
 
+const GEMINI_OCR_SCHEMA = {
+  type: 'object',
+  properties: {
+    pages: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          page: { type: 'integer' },
+          text: { type: 'string' },
+        },
+        required: ['page', 'text'],
+      },
+    },
+    extractedText: { type: 'string' },
+  },
+  required: [],
+};
+
+const GEMINI_META_SCHEMA = {
+  type: 'object',
+  properties: {
+    title: { type: 'string' },
+    subject: { type: 'string' },
+    keywords: {
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 1,
+      maxItems: 10,
+    },
+    tags: {
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 1,
+      maxItems: 8,
+    },
+    sender: { type: 'string' },
+    receiver: { type: 'string' },
+    senderOptions: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    receiverOptions: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    documentDate: { type: 'string' },
+    category: { type: 'string' },
+  },
+  required: ['title', 'subject', 'keywords', 'tags', 'senderOptions', 'receiverOptions', 'documentDate', 'category'],
+};
+
+const GEMINI_SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+  },
+  required: ['summary'],
+};
+
 class AnalysisError extends Error {
   constructor(message, options = {}) {
     super(message);
@@ -151,19 +211,28 @@ async function performUploadAnalysis(app, { orgId, storageKey, mimeType }) {
     const ocr = await generateJsonFromGeminiFile({
       fileUri: geminiReference.fileUri,
       mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: 'Extract readable text from the attached document. Prefer returning an array of pages when possible. Respond strictly as JSON in the form {"pages":[{"page":1,"text":"..."}],"extractedText":"..."}. If page-level text is not possible, supply extractedText only.',
+      prompt: 'Extract readable text from the document. Prefer returning text per page when possible. Always produce JSON that satisfies the provided schema. Provide concatenated text in extractedText when feasible.',
+      responseSchema: GEMINI_OCR_SCHEMA,
     });
 
     const meta = await generateJsonFromGeminiFile({
       fileUri: geminiReference.fileUri,
       mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
+      prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
+      responseSchema: {
+        ...GEMINI_META_SCHEMA,
+        properties: {
+          ...GEMINI_META_SCHEMA.properties,
+          category: { type: 'string', enum: availableCategories },
+        },
+      },
     });
 
     const sum = await generateJsonFromGeminiFile({
       fileUri: geminiReference.fileUri,
       mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: `${orgSummaryPrompt}\n\nRespond strictly as JSON with key "summary" containing the summary string.`,
+      prompt: `${orgSummaryPrompt}\n\nReturn JSON compliant with the provided schema only.`,
+      responseSchema: GEMINI_SUMMARY_SCHEMA,
     });
 
     const ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
