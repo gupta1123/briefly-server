@@ -1,10 +1,10 @@
 import { z } from 'zod';
 import { ai } from './ai.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { routeQuestion } from './agents/router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
 import agentOrchestrator from './agents/agent-orchestrator.js';
+import { uploadBufferToGemini, deleteGeminiFile, generateJsonFromGeminiFile } from './lib/gemini-files.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -2079,13 +2079,15 @@ export function registerRoutes(app) {
     
     let query = db
       .from('documents')
-      .select('id, org_id, title, filename, type, folder_path, subject, description, category, tags, keywords, sender, receiver, document_date, uploaded_at, file_size_bytes, mime_type, content_hash, storage_key, department_id, version_group_id, version_number, is_current_version, supersedes_id')
+      .select('id, org_id, title, filename, type, folder_path, subject, description, category, tags, keywords, sender, receiver, document_date, uploaded_at, file_size_bytes, mime_type, content_hash, storage_key, department_id, version_group_id, version_number, is_current_version, supersedes_id, deleted_at, purge_after')
       .eq('org_id', orgId)
       .order('uploaded_at', { ascending: false })
       .range(offset, offset + Math.min(Number(limit), 200) - 1);
-    
+
     // Apply folder filter
     query = query.filter('type', 'neq', 'folder');
+    // Exclude items that are in the recycle bin
+    query = query.is('deleted_at', null);
     
     // Apply department filtering for non-admin users
     if (!isOrgAdmin) {
@@ -2154,7 +2156,7 @@ export function registerRoutes(app) {
     // Map and filter results
     
     // Double-check: manually filter out any folders that might have slipped through
-    const filteredData = data?.filter(d => d.type !== 'folder') || [];
+    const filteredData = data?.filter(d => d.type !== 'folder' && !d.deleted_at) || [];
     // Manual folder filter safeguard
     
     // Fetch linked documents for all documents
@@ -2245,6 +2247,8 @@ export function registerRoutes(app) {
       isCurrentVersion: d.is_current_version,
       supersedesId: d.supersedes_id,
       documentDate: d.document_date,
+      deletedAt: d.deleted_at,
+      purgeAfter: d.purge_after,
       // Add linked document IDs: explicit links (both directions) + version group siblings
       linkedDocumentIds: Array.from(new Set([...(linksMap[d.id] || []), ...((versionMap.get(d.id)) || [])])),
       // Add version field for backwards compatibility
@@ -3745,7 +3749,7 @@ export function registerRoutes(app) {
       for (const row of data || []) {
         const key = Array.isArray(row.path) ? row.path.join('/') : '';
         if (!key) continue;
-        (results[key] ||= []);
+        if (!results[key]) results[key] = [];
         if (!results[key].includes(row.department_id)) results[key].push(row.department_id);
       }
     }
@@ -3849,14 +3853,7 @@ export function registerRoutes(app) {
     return payload;
   });
 
-  // Initialize Gemini client for file uploads
-  const getGeminiClient = () => {
-    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-    if (!apiKey) throw new Error('Gemini API key not configured');
-    return new GoogleGenerativeAI(apiKey);
-  };
-
-  // Backend OCR/metadata from Storage - download object, send as data URI
+  // Backend OCR/metadata from Storage using Gemini Files API
   app.post('/orgs/:orgId/uploads/analyze', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
     const Schema = z.object({ storageKey: z.string(), mimeType: z.string().optional() });
@@ -3892,9 +3889,6 @@ export function registerRoutes(app) {
 
     const fileSize = fileBlob.size;
     const fileSizeMB = fileSize / (1024 * 1024);
-
-    // Store file size for use in fallback (in case AI processing fails)
-    const originalFileSizeMB = fileSizeMB;
 
     // Updated size limits for Gemini File API (more generous)
     const AI_SIZE_LIMITS = {
@@ -3955,90 +3949,86 @@ export function registerRoutes(app) {
         },
       });
     }
-
-    // Use optimized base64 approach (working and reliable)
-    console.log(`Processing ${fileSizeMB.toFixed(2)}MB file with Gemini...`);
-    const arr = await fileBlob.arrayBuffer();
-    const b64 = Buffer.from(arr).toString('base64');
-    const dataUri = `data:${mimeTypeKey};base64,${b64}`;
-
-    // Use Genkit approach (proven to work)
-    const ocrPrompt = ai.definePrompt({
-      name: 'ocrPrompt',
-      input: { schema: z.object({ dataUri: z.string() }) },
-      output: { schema: z.object({ extractedText: z.string().optional() }) },
-      prompt: `Extract the readable text from the following document:\n\n{{media url=dataUri}}`
-    });
-
-    const metaPrompt = ai.definePrompt({
-      name: 'metaPrompt',
-      input: { schema: z.object({ dataUri: z.string() }) },
-      output: {
-        schema: z.object({
-          keywords: z.array(z.string()).min(3),
-          title: z.string().min(1),
-          subject: z.string().min(1),
-          sender: z.string().optional(),
-          receiver: z.string().optional(),
-          senderOptions: z.array(z.string()).optional(),
-          receiverOptions: z.array(z.string()).optional(),
-          documentDate: z.string().optional(),
-          category: z.string().optional(),
-          tags: z.array(z.string()).min(3),
-        }),
-      },
-      prompt: `You are an expert document information extractor.
-
-1. Identify the subject of the document.
-2. Identify the date the document was sent. If you cannot find one, leave it blank.
-3. Identify all distinct pairs of sender and receiver in the document. Provide primary sender/receiver and list all options.
-4. Extract keywords from the document (minimum 3).
-5. Categorize the document into one of the following: ${availableCategories.join(', ')}.
-6. Generate 3-8 relevant tags and a concise title.
-
-Do NOT include a summary in this response.
-
-Document: {{media url=dataUri}}`,
-    });
-    const summaryPrompt = ai.definePrompt({
-      name: 'summaryPrompt',
-      input: { schema: z.object({ dataUri: z.string() }) },
-      output: { schema: z.object({ summary: z.string() }) },
-      prompt: `${orgSummaryPrompt}\n\n{{media url=dataUri}}`,
-    });
-
-    // Process with reliable approach
-    const [ocrResult, metaResult, sumResult] = await Promise.all([
-      ocrPrompt({ dataUri }),
-      metaPrompt({ dataUri }),
-      summaryPrompt({ dataUri }),
-    ]);
-
-    const [{ output: ocr }, { output: meta }, { output: sum }] = [ocrResult, metaResult, sumResult];
-    try {
-      if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
-        app.log.info({ orgId, storageKey, summaryLen: (sum?.summary || '').length }, 'Analyze: summary generated');
-      }
-    } catch {}
-
-    // Post-process to guarantee required fields
+    console.log(`Processing ${fileSizeMB.toFixed(2)}MB file with Gemini Files API...`);
+    const buffer = Buffer.from(await fileBlob.arrayBuffer());
+    const effectiveMime = mimeType || fileBlob.type || 'application/octet-stream';
     const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
-    const ensured = {
-      title: (meta?.title || baseName),
-      subject: (meta?.subject || baseName),
-      keywords: Array.from(new Set(((meta?.keywords || []).filter(Boolean).slice(0,10)).concat([baseName]))).slice(0, 10),
-      tags: Array.from(new Set(((meta?.tags || []).filter(Boolean).slice(0,8)).concat(['document']))).slice(0, 8),
-      summary: (sum && typeof sum.summary === 'string') ? sum.summary : '',
-      sender: meta?.sender,
-      receiver: meta?.receiver,
-      senderOptions: meta?.senderOptions || [],
-      receiverOptions: meta?.receiverOptions || [],
-      documentDate: meta?.documentDate,
-      category: meta?.category,
-    };
 
-    console.log('✅ Successfully processed file with Gemini');
-    return { ocrText: ocr?.extractedText || '', metadata: ensured };
+    let geminiReference = null;
+    try {
+      geminiReference = await uploadBufferToGemini(buffer, {
+        mimeType: effectiveMime,
+        displayName: baseName,
+      });
+      app.log.info({ orgId, storageKey, fileId: geminiReference.fileId }, 'Analyze uploaded file to Gemini');
+    } catch (error) {
+      app.log.error(error, 'Failed to upload file to Gemini');
+      return reply.code(503).send({ error: 'AI upload failed' });
+    }
+
+    try {
+      const ocr = await generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: 'Extract readable text from the attached document. Prefer returning an array of pages when possible. Respond strictly as JSON in the form {"pages":[{"page":1,"text":"..."}],"extractedText":"..."}. If page-level text is not possible, supply extractedText only.',
+      });
+      const meta = await generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
+      });
+      const sum = await generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: `${orgSummaryPrompt}\n\nRespond strictly as JSON with key "summary" containing the summary string.`,
+      });
+
+      const ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
+      const extractedText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0
+        ? ocr.extractedText
+        : (Array.isArray(ocrPages) ? ocrPages.map((p) => String(p.text || '')).join('\n\n') : '');
+      const ensured = {
+        title: (meta && typeof meta.title === 'string' && meta.title.trim()) ? meta.title : baseName,
+        subject: (meta && typeof meta.subject === 'string' && meta.subject.trim()) ? meta.subject : baseName,
+        keywords: Array.from(new Set((Array.isArray(meta?.keywords) ? meta.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
+        tags: Array.from(new Set((Array.isArray(meta?.tags) ? meta.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
+        summary: (sum && typeof sum.summary === 'string') ? sum.summary : '',
+        sender: typeof meta?.sender === 'string' ? meta.sender : undefined,
+        receiver: typeof meta?.receiver === 'string' ? meta.receiver : undefined,
+        senderOptions: Array.isArray(meta?.senderOptions) ? meta.senderOptions : [],
+        receiverOptions: Array.isArray(meta?.receiverOptions) ? meta.receiverOptions : [],
+        documentDate: typeof meta?.documentDate === 'string' ? meta.documentDate : undefined,
+        category: typeof meta?.category === 'string' ? meta.category : undefined,
+      };
+
+      return {
+        ocrText: extractedText,
+        metadata: ensured,
+        geminiFile: geminiReference,
+      };
+    } catch (error) {
+      app.log.error(error, 'Gemini analysis failed');
+      if (geminiReference?.fileId) {
+        app.log.warn({ orgId, storageKey, fileId: geminiReference.fileId }, 'Analyze deleting Gemini file after failure');
+        await deleteGeminiFile(geminiReference.fileId).catch((err) => {
+          app.log.warn({ orgId, storageKey, fileId: geminiReference.fileId, err: err?.message }, 'Analyze failed to delete Gemini file after failure');
+        });
+      }
+      const fallbackMeta = {
+        title: baseName,
+        subject: baseName,
+        keywords: [baseName],
+        tags: ['document'],
+        summary: '',
+        sender: '',
+        receiver: '',
+        senderOptions: [],
+        receiverOptions: [],
+        documentDate: '',
+        category: availableCategories.includes('General') ? 'General' : availableCategories[0],
+      };
+      return reply.code(503).send({ error: 'AI analysis failed', fallback: { ocrText: '', metadata: fallbackMeta } });
+    }
   });
 
   // Temporary endpoint to apply RLS fix (temporarily without auth for fix)
@@ -4095,7 +4085,16 @@ Document: {{media url=dataUri}}`,
     const userId = req.user?.sub;
     console.log('[FINALIZE] Request body:', req.body);
     console.log('[FINALIZE] Request body keys:', Object.keys(req.body || {}));
-    const Schema = z.object({ documentId: z.string(), storageKey: z.string(), fileSizeBytes: z.number().int().nonnegative(), mimeType: z.string(), contentHash: z.string().optional() });
+    const Schema = z.object({
+      documentId: z.string(),
+      storageKey: z.string(),
+      fileSizeBytes: z.number().int().nonnegative(),
+      mimeType: z.string(),
+      contentHash: z.string().optional(),
+      geminiFileId: z.string().optional(),
+      geminiFileUri: z.string().optional(),
+      geminiFileMimeType: z.string().optional(),
+    });
     const body = Schema.parse(req.body);
     console.log('[FINALIZE] Parsed body:', body);
     const { data, error } = await db
@@ -4110,8 +4109,20 @@ Document: {{media url=dataUri}}`,
 
     // Fire-and-forget ingestion (OCR/metadata via Gemini, chunking, embeddings)
     try {
+      const geminiFile = body.geminiFileUri && body.geminiFileId
+        ? {
+            fileId: body.geminiFileId,
+            fileUri: body.geminiFileUri,
+            mimeType: body.geminiFileMimeType || body.mimeType,
+          }
+        : null;
+      if (geminiFile) {
+        req.log?.info({ orgId, docId: body.documentId, fileId: geminiFile.fileId }, 'finalize received Gemini file handle');
+      } else {
+        req.log?.info({ orgId, docId: body.documentId }, 'finalize received no Gemini file handle');
+      }
       // Run asynchronously; do not await to keep finalize snappy
-      Promise.resolve().then(() => ingestDocument(app, { orgId, docId: body.documentId, storageKey: body.storageKey, mimeType: body.mimeType })).catch((e) => {
+      Promise.resolve().then(() => ingestDocument(app, { orgId, docId: body.documentId, storageKey: body.storageKey, mimeType: body.mimeType, geminiFile })).catch((e) => {
         req.log?.error(e, 'ingest pipeline failed');
       });
     } catch (e) {
@@ -4372,8 +4383,82 @@ Document: {{media url=dataUri}}`,
       lastListDocIds: lastListDocIds.length ? lastListDocIds : undefined,
       filters: userMemory.filters || undefined,
     };
+
+    // Check if we should use degraded mode
+    let useDegradedMode = false;
+    try {
+      // Import the graceful degradation service
+      const { isAIDegraded } = await import('./lib/graceful-degradation.js');
+      useDegradedMode = isAIDegraded();
+    } catch (importError) {
+      console.warn('Could not import graceful degradation service:', importError);
+    }
+
+    if (useDegradedMode) {
+      console.log('⚠️  Using degraded mode for chat request');
+      try {
+        const { generateDegradedResponse } = await import('./lib/graceful-degradation.js');
+        
+        // Get some documents for context
+        const { data: documents } = await db
+          .from('documents')
+          .select('id, title, filename, subject, sender, receiver, document_date, type, category')
+          .eq('org_id', orgId)
+          .order('uploaded_at', { ascending: false })
+          .limit(20);
+        
+        const degradedResponse = await generateDegradedResponse({
+          question,
+          documents: documents || [],
+          conversation,
+          orgId,
+          db
+        });
+        
+        send('delta', degradedResponse.answer);
+        send('end', {
+          done: true,
+          citations: degradedResponse.citations || [],
+          degraded: true,
+          reason: degradedResponse.reason
+        });
+        return;
+      } catch (degradedError) {
+        console.error('Degraded mode failed:', degradedError);
+        send('delta', 'I\'m currently experiencing technical difficulties. Please try again later.');
+        send('end', { done: true, citations: [] });
+        return;
+      }
+    }
+
     // Use new agent orchestrator for routing
-    const routingResult = await agentOrchestrator.processQuestion(db, question, [], conversation);
+    let routingResult;
+    try {
+      const { routeQuestion } = await import('./agents/ai-router.js');
+      routingResult = await routeQuestion(question, conversation);
+    } catch (routingError) {
+      console.error('Agent routing failed, using fallback:', routingError);
+      
+      // Fallback to basic classification
+      try {
+        const { enhancedFallbackClassification } = await import('./lib/fallback-service.js');
+        const fallbackResult = enhancedFallbackClassification(question, conversation);
+        routingResult = {
+          agentType: fallbackResult.agentType,
+          agentName: fallbackResult.agentName,
+          intent: fallbackResult.intent,
+          confidence: fallbackResult.confidence
+        };
+      } catch (fallbackError) {
+        console.error('Fallback classification failed:', fallbackError);
+        routingResult = {
+          agentType: 'content',
+          agentName: 'Content Agent',
+          intent: 'ContentQA',
+          confidence: 0.5
+        };
+      }
+    }
 
     // For backward compatibility, map agent types to legacy modes
     const agentTypeToLegacyMode = {
@@ -4480,14 +4565,44 @@ Document: {{media url=dataUri}}`,
           }
         }
 
-        // Process with the appropriate agent
-        const agentResult = await agentOrchestrator.processQuestion(
-          db,
-          question,
-          relevantDocuments,
-          conversation,
-          routingResult.agentType
-        );
+        // Process with the appropriate agent (use enhanced orchestrator)
+        let agentResult;
+        try {
+          if (agentOrchestrator?.enhancedOrchestrator?.processQuestion) {
+            agentResult = await agentOrchestrator.enhancedOrchestrator.processQuestion(
+              db,
+              question,
+              relevantDocuments,
+              conversation,
+              routingResult.agentType
+            );
+          } else {
+            agentResult = await agentOrchestrator.processQuestion(
+              db,
+              question,
+              relevantDocuments,
+              conversation,
+              routingResult.agentType
+            );
+          }
+        } catch (agentError) {
+          console.error('Primary agent failed, trying fallback:', agentError);
+          
+          // Try with degraded functionality
+          try {
+            const { generateDegradedResponse } = await import('./lib/graceful-degradation.js');
+            agentResult = await generateDegradedResponse({
+              question,
+              documents: relevantDocuments,
+              conversation,
+              orgId,
+              db
+            });
+          } catch (degradedError) {
+            console.error('Degraded agent also failed:', degradedError);
+            throw agentError; // Re-throw original error
+          }
+        }
 
         // Send response
         send('delta', agentResult.answer);
@@ -5382,7 +5497,48 @@ Document: {{media url=dataUri}}`,
         if (f.sender) qb.ilike('sender', ilike(f.sender));
         if (f.receiver) qb.ilike('receiver', ilike(f.receiver));
         if (f.docType) qb.ilike('type', ilike(f.docType));
-        if (f.month) qb.ilike('document_date', ilike(f.month));
+        if (f.month) {
+    // Handle date filtering properly instead of using LIKE on DATE column
+    const dateValue = String(f.month).toLowerCase();
+    
+    if (dateValue === 'last month') {
+      // Get the first day of last month and last day of last month
+      const now = new Date();
+      const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const firstDay = lastMonth.toISOString().split('T')[0];
+      const lastDay = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split('T')[0];
+      qb.gte('document_date', firstDay).lte('document_date', lastDay);
+    } else if (dateValue === 'this month') {
+      // Get the first day of this month and today
+      const now = new Date();
+      const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+      const lastDay = now.toISOString().split('T')[0];
+      qb.gte('document_date', firstDay).lte('document_date', lastDay);
+    } else if (dateValue === 'last week') {
+      // Get the Monday of last week and Sunday of last week
+      const now = new Date();
+      const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
+      const mondayOfLastWeek = new Date(now);
+      mondayOfLastWeek.setDate(now.getDate() - dayOfWeek - 7);
+      const sundayOfLastWeek = new Date(mondayOfLastWeek);
+      sundayOfLastWeek.setDate(mondayOfLastWeek.getDate() + 6);
+      
+      const firstDay = mondayOfLastWeek.toISOString().split('T')[0];
+      const lastDay = sundayOfLastWeek.toISOString().split('T')[0];
+      qb.gte('document_date', firstDay).lte('document_date', lastDay);
+    } else {
+      // Try to parse the date value as a specific date
+      const parsedDate = new Date(dateValue);
+      if (!isNaN(parsedDate.getTime())) {
+        // If it's a valid date, search for documents on that specific date
+        const isoDate = parsedDate.toISOString().split('T')[0];
+        qb.eq('document_date', isoDate);
+      } else {
+        // For partial date matches (e.g. "2023", "january 2023"), use LIKE on the string representation
+        qb.ilike('document_date::text', ilike(f.month));
+      }
+    }
+  }
         const { data, error } = await qb;
         if (error) throw error;
         const rows = data || [];
@@ -6320,4 +6476,11 @@ Document: {{media url=dataUri}}`,
 
   // Register all route modules (dashboard, future modules, etc.)
   registerAllRoutes(app);
+  
+  // Register metadata routes
+  import('./routes/metadata.js').then(module => {
+    module.registerMetadataRoutes(app);
+  }).catch(error => {
+    console.error('Failed to load metadata routes:', error);
+  });
 }

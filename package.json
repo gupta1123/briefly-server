@@ -6,7 +6,12 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "seed:org": "node scripts/seed-org.js"
+    "seed:org": "node scripts/seed-org.js",
+    "regenerate:embeddings": "node scripts/regenerate-embeddings.js",
+    "regenerate:metadata-embeddings": "node scripts/regenerate-metadata-embeddings.js",
+    "test:metadata": "node scripts/test-metadata-embeddings.js",
+    "test:new-agents": "node ../scripts/test-new-agents.js",
+    "verify:orchestrator": "node ../scripts/verify-agent-orchestrator.js"
   },
   "dependencies": {
     "@fastify/cors": "^8.4.0",

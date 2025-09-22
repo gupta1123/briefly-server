@@ -7,6 +7,7 @@ import multipart from '@fastify/multipart';
 import { createClient } from '@supabase/supabase-js';
 import { loadEnv } from './env.js';
 import { registerRoutes } from './routes.js';
+import agentOrchestrator from './agents/agent-orchestrator.js';
 import { ipValidationPlugin } from './ip-validation.js';
 
 async function main() {
@@ -73,6 +74,16 @@ async function main() {
   app.get('/health', async () => ({ status: 'ok' }));
 
   registerRoutes(app);
+
+  // Pre-initialize enhanced orchestrator only to avoid duplicate prompt registrations
+  try {
+    if (agentOrchestrator?.enhancedOrchestrator?.initializeAgents) {
+      await agentOrchestrator.enhancedOrchestrator.initializeAgents(app.supabaseAdmin);
+      app.log.info('Enhanced agent orchestrator pre-initialized');
+    }
+  } catch (e) {
+    app.log.warn(e, 'Enhanced agent orchestrator pre-initialize failed');
+  }
 
   // Central error handler: audit 5xx incidents
   app.setErrorHandler(async (error, request, reply) => {

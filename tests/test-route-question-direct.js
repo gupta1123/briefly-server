@@ -1,117 +1,134 @@
-// Enhanced Agent Router - Improved intent classification
-import { z } from 'zod';
+#!/usr/bin/env node
 
 /**
- * Classify the intent of a user question
- * @param {string} question - The user's question
- * @param {Array} conversation - Conversation history
- * @returns {Object} Routing decision with intent, agent type, and confidence
+ * Test routeQuestion without async wrapper
+ * Run with: node test-route-question-direct.js
  */
-export async function routeQuestion(question, conversation = []) {
+
+// Copy the implementation without async
+function routeQuestion(question, conversation = []) {
   // Extract context from conversation
   const recentMessages = conversation.slice(-3);
   const recentContent = recentMessages.map(m => `${m.role}: ${m.content}`).join('\n');
   
+  console.log('Routing question:', question);
+  console.log('Recent content:', recentContent);
+  
   // Enhanced intent classification with better heuristics
   const intent = classifyIntent(question, recentContent);
+  console.log('Intent classified as:', intent);
+  
   const agentType = mapIntentToAgent(intent);
+  console.log('Agent type mapped to:', agentType);
+  
   const confidence = calculateConfidence(question, intent, recentContent);
+  console.log('Confidence calculated as:', confidence);
+  
+  const agentName = getAgentName(agentType);
+  console.log('Agent name:', agentName);
+  
+  const target = determineTarget(question, conversation);
+  console.log('Target:', target);
   
   return {
     intent,
     agentType,
-    agentName: getAgentName(agentType),
+    agentName,
     confidence,
-    target: determineTarget(question, conversation)
+    target
   };
 }
 
-/**
- * Classify the intent of a question
- * @param {string} question - The user's question
- * @param {string} context - Recent conversation context
- * @returns {string} Intent classification
- */
+// Copy the helper functions
 function classifyIntent(question, context) {
   const q = (question || '').toLowerCase().trim();
   const ctx = (context || '').toLowerCase();
+  
+  console.log('Classifying question:', q);
   
   // Metadata queries - asking about document properties
   if (/\b(what.*about|tell.*about|info.*about|details.*about|metadata.*for|properties.*of|characteristics.*of)\b/i.test(q) ||
       /\b(title|subject|sender|receiver|date|category|type|filename|document.*type|file.*type)\b.*\b(of|for|about)\b/i.test(q) ||
       /\b(list|show|find|search).*\b(documents?|files?)\b/i.test(q)) {
+    console.log('Matched FindFiles pattern');
     return 'FindFiles';
   }
   
   // Metadata extraction - asking for specific metadata fields
   if (/\b(what.*title|what.*subject|who.*sender|who.*receiver|when.*date|what.*category|what.*type)\b/i.test(q) ||
       /\b(title|subject|sender|receiver|date|category|type|filename)\b/i.test(q)) {
+    console.log('Matched Metadata pattern');
     return 'Metadata';
   }
   
   // Content QA - asking questions about document content
   if (/\b(what.*say|what.*state|what.*mention|what.*discuss|explain|describe|summarize|what.*about.*content)\b/i.test(q) ||
       /\b(content|information|details|facts|data)\b.*\b(in|about|regarding)\b/i.test(q)) {
+    console.log('Matched ContentQA pattern');
     return 'ContentQA';
   }
   
   // Linked documents - asking about relationships
   if (/\b(linked|related|connected|associated|versions?|previous|next|later|earlier)\b/i.test(q) ||
       /\b(relations?|connections?|references?|citations?)\b/i.test(q)) {
+    console.log('Matched Linked pattern');
     return 'Linked';
   }
   
   // Preview requests - wanting to see document content
   if (/\b(preview|show|view|see|look).*\b(document|file|content)\b/i.test(q) ||
       /\b(open|display|render)\b/i.test(q)) {
+    console.log('Matched Preview pattern');
     return 'Preview';
   }
   
   // Timeline requests - chronological queries
   if (/\b(timeline|chronological|over.*time|history)\b/i.test(q) ||
       /\b(when.*happen|sequence.*events|order.*occurred)\b/i.test(q)) {
+    console.log('Matched Timeline pattern');
     return 'Timeline';
   }
   
   // Extraction requests - structured data extraction
   if (/\b(extract|pull|get|gather|collect).*\b(fields?|data|information)\b/i.test(q) ||
       /\b(table|spreadsheet|csv|json|structured)\b/i.test(q)) {
+    console.log('Matched Extract pattern');
     return 'Extract';
   }
   
   // Analysis requests - deeper document analysis
   if (/\b(analy(z|s)e|compare|contrast|evaluate|assess|review)\b/i.test(q) ||
       /\b(insights?|findings?|conclusions?|recommendations?)\b/i.test(q)) {
+    console.log('Matched Analysis pattern');
     return 'Analysis';
   }
   
   // Financial document processing
   if (/\b(financial|invoice|bill|payment|amount|due|total|budget|expense|revenue)\b/i.test(q) ||
       /\b(financial|invoice|bill|payment|amount|due|total|budget|expense|revenue)\b/i.test(ctx)) {
+    console.log('Matched Financial pattern');
     return 'Financial';
   }
   
   // Legal document processing
   if (/\b(legal|contract|agreement|law|liability|compliance|clause|section)\b/i.test(q) ||
       /\b(legal|contract|agreement|law|liability|compliance|clause|section)\b/i.test(ctx)) {
+    console.log('Matched Legal pattern');
     return 'Legal';
   }
   
   // Resume/CV processing
   if (/\b(resume|cv|candidate|applicant|skills?|experience|education|qualification)\b/i.test(q) ||
       /\b(resume|cv|candidate|applicant|skills?|experience|education|qualification)\b/i.test(ctx)) {
+    console.log('Matched Resume pattern');
     return 'Resume';
   }
   
   // Default to content QA for general questions
+  console.log('Defaulting to ContentQA');
   return 'ContentQA';
 }
 
-/**
- * Map intent to appropriate agent type
- * @param {string} intent - Classified intent
- * @returns {string} Agent type
- */
 function mapIntentToAgent(intent) {
   const intentToAgentMap = {
     'FindFiles': 'metadata',
@@ -130,11 +147,6 @@ function mapIntentToAgent(intent) {
   return intentToAgentMap[intent] || 'content';
 }
 
-/**
- * Get human-readable agent name
- * @param {string} agentType - Agent type
- * @returns {string} Agent name
- */
 function getAgentName(agentType) {
   const agentNames = {
     'metadata': 'Metadata Agent',
@@ -147,13 +159,6 @@ function getAgentName(agentType) {
   return agentNames[agentType] || 'Content Agent';
 }
 
-/**
- * Calculate confidence score for routing decision
- * @param {string} question - User question
- * @param {string} intent - Classified intent
- * @param {string} context - Conversation context
- * @returns {number} Confidence score (0-1)
- */
 function calculateConfidence(question, intent, context) {
   const q = (question || '').toLowerCase();
   const ctx = (context || '').toLowerCase();
@@ -183,12 +188,6 @@ function calculateConfidence(question, intent, context) {
   return Math.min(confidence, 1.0);
 }
 
-/**
- * Determine target document(s) for the query
- * @param {string} question - User question
- * @param {Array} conversation - Conversation history
- * @returns {Object} Target information
- */
 function determineTarget(question, conversation) {
   const q = (question || '').toLowerCase();
   
@@ -208,99 +207,8 @@ function determineTarget(question, conversation) {
   return {};
 }
 
-/**
- * Expand query with synonyms and related terms
- * @param {string} question - Original question
- * @returns {Object} Expanded query information
- */
-export function expandQuery(question) {
-  const q = (question || '').toLowerCase().trim();
-  
-  // Simple synonym mapping for common terms
-  const synonyms = {
-    'document': ['file', 'paper', 'record', 'report'],
-    'sender': ['from', 'originator', 'author'],
-    'receiver': ['to', 'recipient', 'addressee'],
-    'date': ['time', 'when', 'period'],
-    'title': ['name', 'heading', 'subject'],
-    'category': ['type', 'kind', 'classification'],
-    'content': ['text', 'information', 'data'],
-    'linked': ['related', 'connected', 'associated'],
-    'version': ['revision', 'edition', 'update']
-  };
-  
-  // Extract keywords and expand with synonyms
-  const words = q.split(/\s+/);
-  const expandedTerms = new Set(words);
-  
-  for (const word of words) {
-    const cleanWord = word.replace(/[^\w]/g, '');
-    if (synonyms[cleanWord]) {
-      synonyms[cleanWord].forEach(syn => expandedTerms.add(syn));
-    }
-  }
-  
-  return {
-    original: question,
-    expanded: Array.from(expandedTerms).join(' '),
-    terms: Array.from(expandedTerms)
-  };
-}
+// Test the function
+const testQuestion = 'What is the title of the contract from Microsoft?';
+const result = routeQuestion(testQuestion, []);
 
-/**
- * Extract entities from question
- * @param {string} question - User question
- * @returns {Array} Extracted entities
- */
-export function extractEntities(question) {
-  const q = (question || '').trim();
-  const entities = [];
-  
-  // Extract potential document titles (quoted text)
-  const titleMatches = q.match(/["']([^"']+)["']/g);
-  if (titleMatches) {
-    titleMatches.forEach(match => {
-      entities.push({
-        type: 'title',
-        value: match.slice(1, -1), // Remove quotes
-        confidence: 0.9
-      });
-    });
-  }
-  
-  // Extract potential dates
-  const datePatterns = [
-    /\b(\d{4}-\d{2}-\d{2})\b/,
-    /\b(\d{1,2}\/\d{1,2}\/\d{4})\b/,
-    /\b(\d{1,2}-\d{1,2}-\d{4})\b/,
-    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b/
-  ];
-  
-  for (const pattern of datePatterns) {
-    const dateMatch = q.match(pattern);
-    if (dateMatch) {
-      entities.push({
-        type: 'date',
-        value: dateMatch[0],
-        confidence: 0.8
-      });
-    }
-  }
-  
-  // Extract potential names (capitalized words that might be names)
-  const nameMatches = q.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b/g);
-  if (nameMatches) {
-    nameMatches.forEach(match => {
-      // Simple heuristic: likely names are 2-4 words, capitalized
-      if (match.length > 2 && match.length < 30 && !/^\d+$/.test(match)) {
-        entities.push({
-          type: 'name',
-          value: match,
-          confidence: 0.6
-        });
-      }
-    });
-  }
-  
-  return entities;
-}
+console.log('\nFinal result:', JSON.stringify(result, null, 2));

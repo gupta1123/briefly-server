@@ -19,7 +19,7 @@ class AgentRouter {
       },
       output: {
         schema: z.object({
-          agentType: z.enum(['metadata', 'content', 'financial', 'resume', 'legal']),
+          agentType: z.enum(['metadata', 'content', 'financial', 'resume', 'legal', 'casual']),
           confidence: z.number().min(0).max(1),
           reasoning: z.string(),
         })
@@ -32,8 +32,15 @@ Available agents:
 - financial: Questions about money, costs, budgets, expenses, revenues, profits, amounts, pricing, financial calculations
 - resume: Questions about CVs, resumes, candidate information, work experience, qualifications, skills
 - legal: Questions about legal documents (contracts, agreements, notices, terms, obligations, rights)
+- casual: Casual conversation, greetings, small talk, general questions not related to documents
 
 ROUTING GUIDELINES:
+
+CASUAL CONVERSATION (use casual agent):
+- Greetings like "Hello", "Hi", "Hey", "What's up"
+- Small talk like "How are you?", "How's it going?"
+- General questions not about documents
+- Thank you, goodbye, etc.
 
 FINANCIAL QUESTIONS (use financial agent):
 - Any mention of money, costs, budgets, expenses, revenues, profits
@@ -62,7 +69,7 @@ METADATA QUESTIONS (use metadata agent):
 
 Analyze the question and conversation context to determine:
 1. Which agent is most appropriate
-2. Your confidence level (0.0 to 1.0) - be confident (0.8+) for clear financial questions
+2. Your confidence level (0.0 to 1.0) - be confident (0.8+) for clear document questions, lower confidence (0.3-0.6) for casual conversation
 3. Brief reasoning for your choice
 
 Question: {{{question}}}
