@@ -50,12 +50,44 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
   if (!raw) {
     throw new Error('Gemini response empty');
   }
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    console.error('Gemini JSON parse failure. Response was:', raw);
-    throw error;
+
+  const parseJsonSafely = (input) => {
+    if (!input) return null;
+    const trimmed = input.trim();
+
+    // Try plain JSON first
+    try {
+      return JSON.parse(trimmed);
+    } catch {}
+
+    // Look for fenced code blocks ```json ... ```
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1].trim());
+      } catch {}
+    }
+
+    // Fallback: grab the first {...} section
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && firstBrace < lastBrace) {
+      const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+      try {
+        return JSON.parse(candidate);
+      } catch {}
+    }
+
+    return null;
+  };
+
+  const parsed = parseJsonSafely(raw);
+  if (parsed !== null) {
+    return parsed;
   }
+
+  console.error('Gemini JSON parse failure. Response was:', raw);
+  throw new SyntaxError('Gemini returned non-JSON response');
 }
 
 export function hasGeminiClient() {
