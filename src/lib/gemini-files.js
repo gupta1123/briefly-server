@@ -51,20 +51,37 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
     throw new Error('Gemini response empty');
   }
 
+  const tryParse = (value) => {
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (err) {
+      // Gemini occasionally emits stray backslashes (e.g. \\ or lone \ before non-escape chars).
+      // Escape any invalid sequences and try again before giving up.
+      const sanitized = value.replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+      if (sanitized !== value) {
+        try {
+          return JSON.parse(sanitized);
+        } catch {}
+      }
+      throw err;
+    }
+  };
+
   const parseJsonSafely = (input) => {
     if (!input) return null;
     const trimmed = input.trim();
 
     // Try plain JSON first
     try {
-      return JSON.parse(trimmed);
+      return tryParse(trimmed);
     } catch {}
 
     // Look for fenced code blocks ```json ... ```
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced) {
       try {
-        return JSON.parse(fenced[1].trim());
+        return tryParse(fenced[1].trim());
       } catch {}
     }
 
@@ -72,16 +89,24 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
     const firstBrace = trimmed.indexOf('{');
     const lastBrace = trimmed.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1 && firstBrace < lastBrace) {
-      const candidate = trimmed.slice(firstBrace, lastBrace + 1);
-      try {
-        return JSON.parse(candidate);
-      } catch {}
-    }
+    const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+    try {
+      return tryParse(candidate);
+    } catch {}
+  }
 
-    return null;
-  };
+    // Fallback: Gemini sometimes returns multiple JSON objects separated by commas.
+    try {
+      const merged = tryParse(`[${trimmed}]`);
+      if (Array.isArray(merged) && merged.length > 0) {
+        return Object.assign({}, ...merged);
+      }
+    } catch {}
 
-  const parsed = parseJsonSafely(raw);
+  return null;
+};
+
+const parsed = parseJsonSafely(raw);
   if (parsed !== null) {
     return parsed;
   }

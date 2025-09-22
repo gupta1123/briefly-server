@@ -4,7 +4,7 @@ import { routeQuestion } from './agents/router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
 import agentOrchestrator from './agents/agent-orchestrator.js';
-import { uploadBufferToGemini, deleteGeminiFile, generateJsonFromGeminiFile } from './lib/gemini-files.js';
+import { initUploadAnalysisQueue, enqueueUploadAnalysisJob, getUploadAnalysisJob } from './lib/upload-analysis-queue.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -320,6 +320,8 @@ async function getAdminUserCached(app, userId) {
 }
 
 export function registerRoutes(app) {
+  initUploadAnalysisQueue(app);
+
   app.get('/me', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const userId = req.user?.sub;
@@ -3853,182 +3855,63 @@ export function registerRoutes(app) {
     return payload;
   });
 
-  // Backend OCR/metadata from Storage using Gemini Files API
+  // Backend OCR/metadata from Storage using Gemini Files API (async queue)
   app.post('/orgs/:orgId/uploads/analyze', { preHandler: app.verifyAuth }, async (req, reply) => {
     const orgId = await ensureActiveMember(req);
     const Schema = z.object({ storageKey: z.string(), mimeType: z.string().optional() });
     const { storageKey, mimeType } = Schema.parse(req.body);
 
-    // Get organization categories for AI context
-    const { data: orgSettings } = await req.supabase
-      .from('org_settings')
-      .select('categories')
-      .eq('org_id', orgId)
-      .maybeSingle();
-    const availableCategories = orgSettings?.categories || ['General', 'Legal', 'Financial', 'HR', 'Marketing', 'Technical', 'Invoice', 'Contract', 'Report', 'Correspondence'];
-
-    // Per-org summary prompt
-    let orgSummaryPrompt = 'Write a concise summary (<= 300 words) of the document text. Focus on essential facts and outcomes.';
     try {
-      const { data: priv } = await app.supabaseAdmin
-        .from('org_private_settings')
-        .select('summary_prompt')
-        .eq('org_id', orgId)
-        .maybeSingle();
-      if (priv?.summary_prompt && typeof priv.summary_prompt === 'string') orgSummaryPrompt = priv.summary_prompt;
-    } catch {}
-    try {
-      if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {
-        const preview = String(orgSummaryPrompt).slice(0, 120).replace(/\n/g, ' ');
-        app.log.info({ orgId, promptPreview: preview }, 'Analyze: using org summary prompt');
-      }
-    } catch {}
-
-    const { data: fileBlob, error: dlErr } = await app.supabaseAdmin.storage.from('documents').download(storageKey);
-    if (dlErr || !fileBlob) return reply.code(400).send({ error: 'Unable to download storage object' });
-
-    const fileSize = fileBlob.size;
-    const fileSizeMB = fileSize / (1024 * 1024);
-
-    // Updated size limits for Gemini File API (more generous)
-    const AI_SIZE_LIMITS = {
-      'application/pdf': 100,  // 100MB for PDFs (File API is more efficient)
-      'image/jpeg': 50,        // 50MB for images
-      'image/png': 50,         // 50MB for images
-      'image/gif': 20,         // 20MB for GIFs
-      'application/msword': 50,  // 50MB for DOC
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 50, // 50MB for DOCX
-      'application/vnd.ms-powerpoint': 75, // 75MB for PPT
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 75, // 75MB for PPTX
-      'text/plain': 10,        // 10MB for text files
-      'text/markdown': 10,     // 10MB for markdown
-    };
-
-    const mimeTypeKey = mimeType || fileBlob.type;
-    const sizeLimit = AI_SIZE_LIMITS[mimeTypeKey] || 50; // Default 50MB limit
-
-    // Check if file is too large for AI processing
-    if (fileSizeMB > sizeLimit) {
-      console.log(`File too large for AI processing: ${fileSizeMB.toFixed(2)}MB (limit: ${sizeLimit}MB) for ${mimeTypeKey}`);
-
-      // Enhanced fallback for large files
-      const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
-      const fileExtension = baseName.split('.').pop()?.toLowerCase() || '';
-
-      // Generate better fallback metadata based on file type
-      let enhancedFallback = {
-        title: baseName.replace(/\.[^/.]+$/, ""), // Remove extension from title
-        subject: `${baseName} - Large Document`,
-        keywords: [baseName, fileExtension.toUpperCase(), 'large-file', 'document'],
-        tags: ['document', 'large-file', fileExtension || 'unknown'],
-        summary: `Large ${fileExtension.toUpperCase() || 'document'} file (${fileSizeMB.toFixed(1)}MB) - AI processing skipped due to size limits. Please review and add metadata manually if needed.`,
-        description: `This is a large file that exceeded the AI processing limit of ${sizeLimit}MB. The document has been uploaded successfully but AI analysis was skipped to prevent processing timeouts.`,
-        category: availableCategories.includes('General') ? 'General' : availableCategories[0],
-      };
-
-      // Add file-type specific metadata
-      if (['pdf'].includes(fileExtension)) {
-        enhancedFallback.tags.push('pdf', 'readable');
-        enhancedFallback.category = availableCategories.includes('Report') ? 'Report' : enhancedFallback.category;
-      } else if (['doc', 'docx'].includes(fileExtension)) {
-        enhancedFallback.tags.push('word', 'editable');
-        enhancedFallback.category = availableCategories.includes('Correspondence') ? 'Correspondence' : enhancedFallback.category;
-      } else if (['ppt', 'pptx'].includes(fileExtension)) {
-        enhancedFallback.tags.push('presentation', 'slides');
-        enhancedFallback.category = availableCategories.includes('Report') ? 'Report' : enhancedFallback.category;
-      } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileExtension)) {
-        enhancedFallback.tags.push('image', 'visual');
-        enhancedFallback.category = availableCategories.includes('General') ? 'General' : enhancedFallback.category;
-      }
-
-      return reply.code(413).send({
-        error: `File too large for AI processing (${fileSizeMB.toFixed(2)}MB exceeds ${sizeLimit}MB limit)`,
-        fallback: {
-          ocrText: '',
-          metadata: enhancedFallback,
-        },
+      const job = enqueueUploadAnalysisJob({
+        orgId,
+        storageKey,
+        mimeType: mimeType || null,
+        userId: req.user?.sub || null,
       });
-    }
-    console.log(`Processing ${fileSizeMB.toFixed(2)}MB file with Gemini Files API...`);
-    const buffer = Buffer.from(await fileBlob.arrayBuffer());
-    const effectiveMime = mimeType || fileBlob.type || 'application/octet-stream';
-    const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
-
-    let geminiReference = null;
-    try {
-      geminiReference = await uploadBufferToGemini(buffer, {
-        mimeType: effectiveMime,
-        displayName: baseName,
-      });
-      app.log.info({ orgId, storageKey, fileId: geminiReference.fileId }, 'Analyze uploaded file to Gemini');
+      return reply.code(202).send(job);
     } catch (error) {
-      app.log.error(error, 'Failed to upload file to Gemini');
-      return reply.code(503).send({ error: 'AI upload failed' });
+      req.log?.error?.(error, 'Failed to enqueue upload analysis job');
+      return reply.code(500).send({ error: 'Failed to schedule analysis' });
+    }
+  });
+
+  app.get('/orgs/:orgId/uploads/analyze/:jobId', { preHandler: app.verifyAuth }, async (req, reply) => {
+    const orgId = await ensureActiveMember(req);
+    const { jobId } = req.params;
+
+    const job = getUploadAnalysisJob(jobId);
+    if (!job || job.orgId !== orgId) {
+      return reply.code(404).send({ error: 'Job not found' });
     }
 
-    try {
-      const ocr = await generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: 'Extract readable text from the attached document. Prefer returning an array of pages when possible. Respond strictly as JSON in the form {"pages":[{"page":1,"text":"..."}],"extractedText":"..."}. If page-level text is not possible, supply extractedText only.',
-      });
-      const meta = await generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
-      });
-      const sum = await generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: `${orgSummaryPrompt}\n\nRespond strictly as JSON with key "summary" containing the summary string.`,
-      });
-
-      const ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
-      const extractedText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0
-        ? ocr.extractedText
-        : (Array.isArray(ocrPages) ? ocrPages.map((p) => String(p.text || '')).join('\n\n') : '');
-      const ensured = {
-        title: (meta && typeof meta.title === 'string' && meta.title.trim()) ? meta.title : baseName,
-        subject: (meta && typeof meta.subject === 'string' && meta.subject.trim()) ? meta.subject : baseName,
-        keywords: Array.from(new Set((Array.isArray(meta?.keywords) ? meta.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
-        tags: Array.from(new Set((Array.isArray(meta?.tags) ? meta.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
-        summary: (sum && typeof sum.summary === 'string') ? sum.summary : '',
-        sender: typeof meta?.sender === 'string' ? meta.sender : undefined,
-        receiver: typeof meta?.receiver === 'string' ? meta.receiver : undefined,
-        senderOptions: Array.isArray(meta?.senderOptions) ? meta.senderOptions : [],
-        receiverOptions: Array.isArray(meta?.receiverOptions) ? meta.receiverOptions : [],
-        documentDate: typeof meta?.documentDate === 'string' ? meta.documentDate : undefined,
-        category: typeof meta?.category === 'string' ? meta.category : undefined,
-      };
-
+    if (job.status === 'succeeded') {
       return {
-        ocrText: extractedText,
-        metadata: ensured,
-        geminiFile: geminiReference,
+        jobId: job.jobId,
+        status: 'succeeded',
+        result: job.result?.data || null,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
       };
-    } catch (error) {
-      app.log.error(error, 'Gemini analysis failed');
-      if (geminiReference?.fileId) {
-        app.log.warn({ orgId, storageKey, fileId: geminiReference.fileId }, 'Analyze deleting Gemini file after failure');
-        await deleteGeminiFile(geminiReference.fileId).catch((err) => {
-          app.log.warn({ orgId, storageKey, fileId: geminiReference.fileId, err: err?.message }, 'Analyze failed to delete Gemini file after failure');
-        });
-      }
-      const fallbackMeta = {
-        title: baseName,
-        subject: baseName,
-        keywords: [baseName],
-        tags: ['document'],
-        summary: '',
-        sender: '',
-        receiver: '',
-        senderOptions: [],
-        receiverOptions: [],
-        documentDate: '',
-        category: availableCategories.includes('General') ? 'General' : availableCategories[0],
-      };
-      return reply.code(503).send({ error: 'AI analysis failed', fallback: { ocrText: '', metadata: fallbackMeta } });
     }
+
+    if (job.status === 'failed') {
+      return {
+        jobId: job.jobId,
+        status: 'failed',
+        error: job.result?.error || 'Analysis failed',
+        fallback: job.result?.fallback || null,
+        httpStatus: job.result?.httpStatus || 500,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+      };
+    }
+
+    return {
+      jobId: job.jobId,
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    };
   });
 
   // Temporary endpoint to apply RLS fix (temporarily without auth for fix)
