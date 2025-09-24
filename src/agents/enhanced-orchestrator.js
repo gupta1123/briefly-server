@@ -1,20 +1,8 @@
 import AgentRouter from './agent-router.js';
 import BaseAgent from './base-agent.js';
 import MetadataAgent from './metadata-agent.js';
-import FinancialAgent from './financial-agent.js';
-import ResumeAgent from './resume-agent.js';
-import LegalAgent from './legal-agent.js';
 import CasualAgent from './casual-agent.js';
 
-// Import new True AI Agents
-import TrueAIAgent from './true-ai-agent.js';
-import FinderTrueAIAgent from './finder-true-ai-agent.js';
-import ComparisonTrueAIAgent from './comparison-true-ai-agent.js';
-import TimelineTrueAIAgent from './timeline-true-ai-agent.js';
-import AnalysisTrueAIAgent from './analysis-true-ai-agent.js';
-import ActionTrueAIAgent from './action-true-ai-agent.js';
-import ResearchTrueAIAgent from './research-true-ai-agent.js';
-import ComplianceTrueAIAgent from './compliance-true-ai-agent.js';
 
 /**
  * Enhanced Agent Orchestrator - Advanced multi-agent coordination and orchestration
@@ -70,41 +58,19 @@ class EnhancedAgentOrchestrator {
    * Get the appropriate agent class for an agent type
    */
   getAgentClass(agentType) {
-    // First try to get the true AI agent class
-    const trueAIAgentClass = this.getTrueAIAgentClass(agentType);
-    if (trueAIAgentClass) {
-      return trueAIAgentClass;
-    }
-    
-    // Fallback to legacy agent classes
+    // Use legacy agent classes
     const agentClasses = {
       'metadata': MetadataAgent,
       'content': BaseAgent, // Content agent uses base functionality
-      'financial': FinancialAgent,
-      'resume': ResumeAgent,
-      'legal': LegalAgent,
       'casual': CasualAgent
     };
-
+    
     return agentClasses[agentType] || BaseAgent;
   }
 
   /**
    * Get the appropriate true AI agent class for an agent type
    */
-  getTrueAIAgentClass(agentType) {
-    const trueAIAgentClasses = {
-      'finder': FinderTrueAIAgent,
-      'comparison': ComparisonTrueAIAgent,
-      'timeline': TimelineTrueAIAgent,
-      'analysis': AnalysisTrueAIAgent,
-      'action': ActionTrueAIAgent,
-      'research': ResearchTrueAIAgent,
-      'compliance': ComplianceTrueAIAgent
-    };
-
-    return trueAIAgentClasses[agentType] || null;
-  }
 
   /**
    * Process a question using single agent (backward compatibility)
@@ -254,7 +220,7 @@ class EnhancedAgentOrchestrator {
     // For now, we'll create a simple plan with primary and secondary agents
     // Normalize unknown agent types to 'content'
     const normalize = (t) => {
-      const allowed = new Set(['metadata','content','financial','resume','legal','finder','comparison','timeline','analysis','action','research','compliance']);
+      const allowed = new Set(['metadata','content','casual']);
       const v = String(t || '').toLowerCase();
       return allowed.has(v) ? v : 'content';
     };
@@ -284,16 +250,13 @@ class EnhancedAgentOrchestrator {
       secondaryAgents.push('metadata');
     }
 
-    // Add analysis agent for complex questions
-    if (q.includes('compare') || q.includes('analyze') || q.includes('difference') || 
-        q.includes('similar') || q.includes('relationship')) {
-      secondaryAgents.push('analysis');
-    }
-
-    // Add finder agent for search-related questions
-    if (q.includes('find') || q.includes('search') || q.includes('look for') || 
-        q.includes('show') || q.includes('list')) {
-      secondaryAgents.push('finder');
+    // Add content agent for complex questions
+    if (primaryAgent !== 'content' && 
+        (q.includes('compare') || q.includes('analyze') || q.includes('difference') || 
+         q.includes('similar') || q.includes('relationship') || q.includes('find') || 
+         q.includes('search') || q.includes('look for') || q.includes('show') || 
+         q.includes('list'))) {
+      secondaryAgents.push('content');
     }
 
     return [...new Set(secondaryAgents)]; // Remove duplicates
@@ -803,4 +766,4 @@ class EnhancedAgentOrchestrator {
   }
 }
 
-export default new EnhancedAgentOrchestrator();
+export default EnhancedAgentOrchestrator;

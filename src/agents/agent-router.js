@@ -19,7 +19,7 @@ class AgentRouter {
       },
       output: {
         schema: z.object({
-          agentType: z.enum(['metadata', 'content', 'financial', 'resume', 'legal', 'casual']),
+          agentType: z.enum(['metadata', 'content', 'casual']),
           confidence: z.number().min(0).max(1),
           reasoning: z.string(),
         })
@@ -29,9 +29,6 @@ class AgentRouter {
 Available agents:
 - metadata: Questions about document properties (dates, senders, receivers, types, categories, filenames)
 - content: Questions requiring deep analysis of document content and text
-- financial: Questions about money, costs, budgets, expenses, revenues, profits, amounts, pricing, financial calculations
-- resume: Questions about CVs, resumes, candidate information, work experience, qualifications, skills
-- legal: Questions about legal documents (contracts, agreements, notices, terms, obligations, rights)
 - casual: Casual conversation, greetings, small talk, general questions not related to documents
 
 ROUTING GUIDELINES:
@@ -42,19 +39,6 @@ CASUAL CONVERSATION (use casual agent):
 - General questions not about documents
 - Thank you, goodbye, etc.
 
-FINANCIAL QUESTIONS (use financial agent):
-- Any mention of money, costs, budgets, expenses, revenues, profits
-- Words like: cost, price, amount, budget, expense, revenue, profit, crore, lakh, rupees, dollars, financial
-- Project costs, expansion costs, total costs, construction costs
-- Financial calculations, amounts, pricing information
-- Budget allocations, financial planning, cost analysis
-
-Examples of financial questions:
-- "What was the project cost?"
-- "How much did the expansion cost?"
-- "What is the total budget?"
-- "What are the expenses for this quarter?"
-- "What was the existing project cost, the project cost for the proposed expansion, and the total project cost in Crores?"
 
 CONTENT QUESTIONS (use content agent):
 - General questions about document content
@@ -132,9 +116,6 @@ Return your analysis in the specified JSON format.`
     const mapping = {
       'metadata': 'Metadata',
       'content': 'ContentQA',
-      'financial': 'Analytics',
-      'resume': 'ContentQA',
-      'legal': 'ContentQA'
     };
     return mapping[agentType] || 'ContentQA';
   }

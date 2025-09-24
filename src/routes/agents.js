@@ -3,7 +3,7 @@
 
 import { z } from 'zod';
 import { routeQuestion } from '../agents/ai-router.js';
-import agentOrchestrator from '../agents/agent-orchestrator.js';
+import EnhancedAgentOrchestrator from '../agents/enhanced-orchestrator.js';
 import { hybridSearch } from '../lib/metadata-embeddings.js';
 import { generateEmbedding } from '../lib/embeddings.js';
 import { rerankCandidates } from '../lib/rerank-service.js';
@@ -168,7 +168,8 @@ export function registerAgentRoutes(app) {
       });
       
       // Process with coordinated multi-agent approach
-      const agentResponse = await agentOrchestrator.processWithCoordination(
+      const orchestrator = new EnhancedAgentOrchestrator();
+      const agentResponse = await orchestrator.processWithCoordination(
         db, 
         question, 
         documents, 
@@ -229,7 +230,8 @@ export function registerAgentRoutes(app) {
     const { agentTypes, question, documents = [], conversation = [] } = Schema.parse(req.body || {});
     
     try {
-      const result = await agentOrchestrator.executeParallel(db, agentTypes, question, documents, conversation);
+      const orchestrator = new EnhancedAgentOrchestrator();
+      const result = await orchestrator.executeParallel(db, agentTypes, question, documents, conversation);
       
       return {
         success: true,
@@ -269,7 +271,8 @@ export function registerAgentRoutes(app) {
     const { agentSequence, question, documents = [], conversation = [] } = Schema.parse(req.body || {});
     
     try {
-      const result = await agentOrchestrator.chainAgents(db, agentSequence, question, documents, conversation);
+      const orchestrator = new EnhancedAgentOrchestrator();
+      const result = await orchestrator.chainAgents(db, agentSequence, question, documents, conversation);
       
       return {
         success: true,
@@ -308,7 +311,8 @@ export function registerAgentRoutes(app) {
     const { question, documents = [], conversation = [] } = Schema.parse(req.body || {});
     
     try {
-      const result = await agentOrchestrator.processWithCoordination(db, question, documents, conversation);
+      const orchestrator = new EnhancedAgentOrchestrator();
+      const result = await orchestrator.processWithCoordination(db, question, documents, conversation);
       
       return {
         success: true,
@@ -409,12 +413,6 @@ async function processWithEnhancedAgent(
       return await processMetadataQuery(db, orgId, question, conversation, userMemory, routingResult, send);
     case 'content':
       return await processContentQuery(db, orgId, userId, question, conversation, userMemory, routingResult, send);
-    case 'financial':
-      return await processFinancialQuery(db, orgId, question, conversation, userMemory, routingResult, send);
-    case 'legal':
-      return await processLegalQuery(db, orgId, question, conversation, userMemory, routingResult, send);
-    case 'resume':
-      return await processResumeQuery(db, orgId, question, conversation, userMemory, routingResult, send);
     case 'casual':
       return await processCasualQuery(question, conversation, routingResult, send);
     default:
@@ -886,36 +884,6 @@ This is a summary based on the most relevant documents found using semantic sear
   };
 }
 
-// Placeholder functions for other agent types (to be implemented)
-async function processFinancialQuery(db, orgId, question, conversation, userMemory, routingResult, send) {
-  send('stage', { agent: 'FinancialAgent', step: 'analyzing' });
-  
-  // This would be implemented with financial document analysis
-  return {
-    answer: 'Financial analysis agent is processing your request. This feature is being enhanced.',
-    citations: []
-  };
-}
-
-async function processLegalQuery(db, orgId, question, conversation, userMemory, routingResult, send) {
-  send('stage', { agent: 'LegalAgent', step: 'reviewing' });
-  
-  // This would be implemented with legal document analysis
-  return {
-    answer: 'Legal analysis agent is processing your request. This feature is being enhanced.',
-    citations: []
-  };
-}
-
-async function processResumeQuery(db, orgId, question, conversation, userMemory, routingResult, send) {
-  send('stage', { agent: 'ResumeAgent', step: 'evaluating' });
-  
-  // This would be implemented with resume/CV analysis
-  return {
-    answer: 'Resume analysis agent is processing your request. This feature is being enhanced.',
-    citations: []
-  };
-}
 
 // Enhanced casual conversation processing
 async function processCasualQuery(question, conversation, routingResult, send) {

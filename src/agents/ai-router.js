@@ -43,7 +43,7 @@ export async function classifyIntentWithAI(question, conversation = []) {
     // If a dedicated router model is specified, use a direct JSON prompt via generateText
     if (routerModel) {
       try { console.log('🧭 Router model override:', routerModel); } catch {}
-      const routerPrompt = `You are an intelligent document assistant that classifies user intents.\n\nClassify the following question and provide structured output.\n\nContext:\n${recentContent || ''}\n\nQuestion:\n"${question}"\n\nAvailable Intent Types:\n- FindFiles: Searching for documents by properties (title, sender, date, etc.)\n- Metadata: Asking about document properties (title, subject, sender, etc.)\n- ContentQA: Questions about document content\n- Linked: Asking about related/linked documents\n- Preview: Wanting to see document content\n- Timeline: Chronological queries\n- Extract: Structured data extraction\n- Analysis: Deep document analysis\n- Financial: Financial document processing\n- Legal: Legal document processing\n- Resume: Resume/CV analysis\n- Summarize: Document summarization\n- Compare: Document comparison\n- Sentiment: Sentiment analysis\n- Casual: Casual conversation, greetings, small talk, general questions not related to documents\n- Custom: Other custom queries\n\nRespond ONLY with valid JSON in this exact format:\n{\n  "intent": "<intent>",\n  "agentType": "<agent_type>",\n  "confidence": <confidence_score_between_0_and_1>,\n  "needsClarification": <boolean>,\n  "clarificationQuestion": "<question_if_needs_clarification>"\n}`;
+      const routerPrompt = `You are an intelligent document assistant that classifies user intents.\n\nClassify the following question and provide structured output.\n\nContext:\n${recentContent || ''}\n\nQuestion:\n"${question}"\n\nAvailable Intent Types:\n- FindFiles: Searching for documents by properties (title, sender, date, etc.)\n- Metadata: Asking about document properties (title, subject, sender, etc.)\n- ContentQA: Questions about document content\n- Linked: Asking about related/linked documents\n- Preview: Wanting to see document content\n- Timeline: Chronological queries\n- Extract: Structured data extraction\n- Analysis: Deep document analysis\n- Summarize: Document summarization\n- Compare: Document comparison\n- Sentiment: Sentiment analysis\n- Casual: Casual conversation, greetings, small talk, general questions not related to documents\n- Custom: Other custom queries\n\nRespond ONLY with valid JSON in this exact format:\n{\n  "intent": "<intent>",\n  "agentType": "<agent_type>",\n  "confidence": <confidence_score_between_0_and_1>,\n  "needsClarification": <boolean>,\n  "clarificationQuestion": "<question_if_needs_clarification>"\n}`;
       const gen = await generateText({ prompt: routerPrompt, model: routerModel, temperature: 0.2 });
       let parsed;
       try { parsed = JSON.parse(gen.text || '{}'); } catch { parsed = null; }
@@ -88,10 +88,9 @@ const intentPrompt = definePrompt({
     schema: z.object({ 
       intent: z.enum([
         'FindFiles', 'Metadata', 'ContentQA', 'Linked', 'Preview', 
-        'Timeline', 'Extract', 'Analysis', 'Financial', 'Legal', 
-        'Resume', 'Summarize', 'Compare', 'Sentiment', 'Custom'
+        'Timeline', 'Extract', 'Analysis', 'Summarize', 'Compare', 'Sentiment', 'Custom'
       ]),
-      agentType: z.enum(['metadata', 'content', 'financial', 'legal', 'resume', 'analysis', 'casual']),
+      agentType: z.enum(['metadata', 'content', 'casual']),
       confidence: z.number().min(0).max(1),
       needsClarification: z.boolean().optional(),
       clarificationQuestion: z.string().optional()
@@ -116,9 +115,6 @@ Available Intent Types:
 - Timeline: Chronological queries
 - Extract: Structured data extraction
 - Analysis: Deep document analysis
-- Financial: Financial document processing
-- Legal: Legal document processing
-- Resume: Resume/CV analysis
 - Summarize: Document summarization
 - Compare: Document comparison
 - Sentiment: Sentiment analysis
@@ -333,11 +329,7 @@ function getAgentName(agentType) {
   const agentNames = {
     'metadata': 'Metadata Agent',
     'content': 'Content Agent',
-    'financial': 'Financial Agent',
-    'legal': 'Legal Agent',
-    'resume': 'Resume Agent',
-    'casual': 'Casual Agent',
-    'analysis': 'Analysis Agent'
+    'casual': 'Casual Agent'
   };
   
   return agentNames[agentType] || 'Content Agent';

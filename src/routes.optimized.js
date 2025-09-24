@@ -3,10 +3,10 @@
 import { z } from 'zod';
 import { ai } from './ai.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { routeQuestion } from './agents/router.js';
+import { routeQuestion } from './agents/ai-router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
-import agentOrchestrator from './agents/agent-orchestrator.js';
+import EnhancedAgentOrchestrator from './agents/enhanced-orchestrator.js';
 import { 
   userCache, 
   orgCache, 

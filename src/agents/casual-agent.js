@@ -65,7 +65,7 @@ class CasualAgent extends BaseAgent {
              "• Answer questions about document contents\n" +
              "• Extract key information from documents\n" +
              "• Compare similar documents\n" +
-             "• Analyze financial or legal documents\n" +
+             "• Analyze document content\n" +
              "• Help you understand complex documents\n\n" +
              "What would you like to do with your documents?";
     }

@@ -10,11 +10,11 @@ async function testEnhancedOrchestrator() {
   // Test agent class retrieval
   const metadataAgentClass = orchestrator.getAgentClass('metadata');
   const contentAgentClass = orchestrator.getAgentClass('content');
-  const finderAgentClass = orchestrator.getAgentClass('finder');
+  const casualAgentClass = orchestrator.getAgentClass('casual');
   
   console.log('✅ Metadata Agent Class:', metadataAgentClass ? 'Found' : 'Not Found');
   console.log('✅ Content Agent Class:', contentAgentClass ? 'Found' : 'Not Found');
-  console.log('✅ Finder Agent Class:', finderAgentClass ? 'Found' : 'Not Found');
+  console.log('✅ Casual Agent Class:', casualAgentClass ? 'Found' : 'Not Found');
   
   // Test secondary agent determination
   const secondaryAgents1 = orchestrator.determineSecondaryAgents('Find documents from last month', 'content');
@@ -35,8 +35,8 @@ async function testEnhancedOrchestrator() {
   // Test grouping similar insights
   const testInsights = [
     { agent: 'metadata', answer: 'The document title is Report.pdf', confidence: 0.9 },
-    { agent: 'finder', answer: 'This document is called Report.pdf', confidence: 0.8 },
-    { agent: 'analysis', answer: 'The cost is $100', confidence: 0.7 },
+    { agent: 'content', answer: 'This document is called Report.pdf', confidence: 0.8 },
+    { agent: 'casual', answer: 'The cost is $100', confidence: 0.7 },
     { agent: 'content', answer: 'The price is $50', confidence: 0.6 }
   ];
   

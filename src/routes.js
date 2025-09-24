@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import { ai } from './ai.js';
-import { routeQuestion } from './agents/router.js';
+import { routeQuestion } from './agents/ai-router.js';
 import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
-import agentOrchestrator from './agents/agent-orchestrator.js';
+import EnhancedAgentOrchestrator from './agents/enhanced-orchestrator.js';
 import { initUploadAnalysisQueue, enqueueUploadAnalysisJob, getUploadAnalysisJob } from './lib/upload-analysis-queue.js';
 
 function requireOrg(req) {
@@ -4448,26 +4448,17 @@ export function registerRoutes(app) {
           }
         }
 
-        // Process with the appropriate agent (use enhanced orchestrator)
+        // Process with the enhanced orchestrator
         let agentResult;
         try {
-          if (agentOrchestrator?.enhancedOrchestrator?.processQuestion) {
-            agentResult = await agentOrchestrator.enhancedOrchestrator.processQuestion(
-              db,
-              question,
-              relevantDocuments,
-              conversation,
-              routingResult.agentType
-            );
-          } else {
-            agentResult = await agentOrchestrator.processQuestion(
-              db,
-              question,
-              relevantDocuments,
-              conversation,
-              routingResult.agentType
-            );
-          }
+          const orchestrator = new EnhancedAgentOrchestrator();
+          agentResult = await orchestrator.processQuestion(
+            db,
+            question,
+            relevantDocuments,
+            conversation,
+            routingResult.agentType
+          );
         } catch (agentError) {
           console.error('Primary agent failed, trying fallback:', agentError);
           
@@ -4954,7 +4945,7 @@ export function registerRoutes(app) {
     // Finder mode — list/search documents (explicit file finding)
     if (primary === 'finder') {
       try {
-        send('stage', { agent: 'FinderAgent', step: 'searching' });
+        send('stage', { agent: 'SearchAgent', step: 'searching' });
 
         const f = decision.filters || {};
         const cleaned = String(question || '')
@@ -5138,7 +5129,7 @@ export function registerRoutes(app) {
     // Metadata mode (simple filter over documents)
     if (primary === 'metadata' && allowMetadata) {
       try {
-        send('stage', { agent: 'FinderAgent', step: 'searching_metadata' });
+        send('stage', { agent: 'MetadataAgent', step: 'searching_metadata' });
         const s = `%${question.trim()}%`;
         const { data, error } = await db
           .from('documents')
