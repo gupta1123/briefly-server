@@ -1,20 +1,19 @@
-// Test Agent Routes - Simplified REST-based implementation
-// This file implements the simplified agentic chat functionality
+// Streaming Test Agent Routes - Server-Sent Events implementation
+// This file implements streaming chat functionality with real-time responses
 
 import { z } from 'zod';
-import { callAgnoChat, formatAgnoResponse } from '../lib/agno-service.js';
+import { callAgnoChatStream, formatAgnoResponse } from '../lib/agno-service-streaming.js';
 import { isAIDegraded, generateDegradedResponse } from '../lib/graceful-degradation.js';
 
 /**
- * Register test agent routes
+ * Register streaming test agent routes
  * @param {Object} app - Fastify app instance
  */
-export function registerTestAgentRoutes(app) {
-  console.log('🧪 Registering simplified test agent routes...');
+export function registerStreamingTestAgentRoutes(app) {
+  console.log('🌊 Registering streaming test agent routes...');
 
-  // Unified REST chat endpoint with context scoping (doc | folder | org)
-  // Response is non-streaming JSON with grounded citations.
-  app.post('/orgs/:orgId/chat/query', {
+  // Streaming chat endpoint with Server-Sent Events
+  app.post('/orgs/:orgId/chat/stream', {
     preHandler: [app.verifyAuth, app.requireIpAccess]
   }, async (req, reply) => {
     const db = req.supabase;
@@ -63,6 +62,7 @@ export function registerTestAgentRoutes(app) {
     try {
       const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
 
+      // Handle ordinal queries (e.g., "show me the first document")
       const parseOrdinal = (txt) => {
         const m = String(txt || '').toLowerCase().match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|#(\d+))\b/);
         if (!m) return null;
@@ -103,35 +103,98 @@ export function registerTestAgentRoutes(app) {
             if (doc.sender) parts.push(String(doc.sender));
             const suffix = ord === 1 ? 'st' : ord === 2 ? 'nd' : ord === 3 ? 'rd' : 'th';
             const answer = `### Details for the ${ord}${suffix} item\n\n- ${parts.join(' — ')}`;
-            return reply.send({
-              answer,
+            
+            // Send as streaming response
+            reply.raw.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'Access-Control-Allow-Origin': '*',
+            });
+            
+            // Send initial tool call event
+            reply.raw.write(`data: ${JSON.stringify({
+              type: 'tool_call',
+              message: '🔍 Using ordinal memory lookup...'
+            })}\n\n`);
+            
+            // Send content chunks
+            const content = answer;
+            const chunkSize = 50;
+            for (let i = 0; i < content.length; i += chunkSize) {
+              const chunk = content.slice(i, i + chunkSize);
+              reply.raw.write(`data: ${JSON.stringify({
+                type: 'content',
+                chunk: chunk,
+                full_content: content.slice(0, i + chunkSize),
+                chunk_count: Math.floor(i / chunkSize) + 1,
+                is_complete: false
+              })}\n\n`);
+              await new Promise(resolve => setTimeout(resolve, 50)); // Small delay for streaming effect
+            }
+            
+            // Send completion event
+            reply.raw.write(`data: ${JSON.stringify({
+              type: 'complete',
+              full_content: answer,
+              chunk_count: Math.ceil(content.length / chunkSize),
+              total_time: content.length * 50 / 1000,
+              chars_per_second: 1000 / 50,
               citations: [{ docId: doc.id, docName: name, snippet: `${name} — ${doc.document_date || ''}` }],
               agent: { type: 'metadata', name: 'OrdinalSelector', confidence: 0.95 },
-              agentType: 'metadata',
-              agentName: 'OrdinalSelector',
-              considered: { docIds: [doc.id], strategy: 'ordinal_memory' },
-              executionTrace: [],
-            });
+              is_complete: true
+            })}\n\n`);
+            
+            reply.raw.end();
+            return;
           }
         }
       }
 
+      // Handle degraded mode
       if (isAIDegraded()) {
         const degraded = await generateDegradedResponse({ question, documents: [], conversation, orgId, db });
-        return reply.send({
-          answer: degraded.answer,
+        
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        });
+        
+        // Stream degraded response
+        const content = degraded.answer;
+        const chunkSize = 50;
+        for (let i = 0; i < content.length; i += chunkSize) {
+          const chunk = content.slice(i, i + chunkSize);
+          reply.raw.write(`data: ${JSON.stringify({
+            type: 'content',
+            chunk: chunk,
+            full_content: content.slice(0, i + chunkSize),
+            chunk_count: Math.floor(i / chunkSize) + 1,
+            is_complete: false
+          })}\n\n`);
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        
+        reply.raw.write(`data: ${JSON.stringify({
+          type: 'complete',
+          full_content: content,
+          chunk_count: Math.ceil(content.length / chunkSize),
+          total_time: content.length * 50 / 1000,
+          chars_per_second: 1000 / 50,
           citations: degraded.citations || [],
           agent: { type: 'degraded', name: 'Fallback', confidence: degraded.confidence || 0.4 },
-          agentType: 'degraded',
-          agentName: 'Fallback',
-          considered: { docIds: [], strategy: 'degraded' },
-          executionTrace: [],
           degraded: true,
-          reason: degraded.reason || 'DEGRADED'
-        });
+          is_complete: true
+        })}\n\n`);
+        
+        reply.raw.end();
+        return;
       }
 
-      const { data } = await callAgnoChat({
+      // Call streaming Agno service
+      const stream = await callAgnoChatStream({
         orgId,
         userId,
         question,
@@ -142,63 +205,53 @@ export function registerTestAgentRoutes(app) {
         strictCitations,
       });
 
-      const formatted = formatAgnoResponse(data, question);
-      const { raw, sessionId, ...payload } = formatted;
+      // Set up Server-Sent Events headers
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      });
 
-      if (!payload.agent && payload.agentType) {
-        payload.agent = {
-          type: payload.agentType,
-          name: payload.agentName,
-          confidence: payload.confidence,
-        };
+      // Stream the response
+      for await (const chunk of stream) {
+        const formatted = formatAgnoResponse(chunk, question);
+        reply.raw.write(`data: ${JSON.stringify(formatted)}\n\n`);
       }
 
-      if (!payload.expandedQuery) {
-        payload.expandedQuery = { original: question, expanded: question, terms: [question] };
-      }
-
-      payload.citations = Array.isArray(payload.citations) ? payload.citations : [];
-      payload.entities = Array.isArray(payload.entities) ? payload.entities : [];
-      payload.agentInsights = Array.isArray(payload.agentInsights) ? payload.agentInsights : [];
-      payload.consensusResult = payload.consensusResult ?? null;
-      payload.executionTrace = Array.isArray(payload.executionTrace) ? payload.executionTrace : [];
-      if (sessionId) payload.sessionId = sessionId;
-
-      return reply.send(payload);
+      reply.raw.end();
 
     } catch (error) {
-      console.error('Agent processing error:', error);
+      console.error('Streaming agent processing error:', error);
       
-      // Handle rate limit errors specifically
-      let errorMessage = 'An error occurred while processing your request. Please try again.';
-      let errorCode = 'AGENT_PROCESSING_ERROR';
-      
-      if (error.message && error.message.includes('rate limit')) {
-        errorMessage = 'The AI service is currently busy due to rate limits. Please wait a moment and try again.';
-        errorCode = 'RATE_LIMIT_EXCEEDED';
-      } else if (error.message && error.message.includes('quota')) {
-        errorMessage = 'The AI service has reached its quota limit. Please try again later.';
-        errorCode = 'QUOTA_EXCEEDED';
+      // Check if headers were already sent
+      if (!reply.raw.headersSent) {
+        // Send error as streaming response
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        });
       }
       
-      return {
-        answer: errorMessage,
-        citations: [],
-        agentType: 'error',
-        agentName: 'Error Handler',
-        intent: 'Error',
-        confidence: 0.1,
-        expandedQuery: { original: question, expanded: question, terms: [question] },
-        entities: [],
-        agentInsights: [],
-        consensusResult: null,
-        executionTrace: [],
-        errorCode: errorCode
-      };
+      const errorMessage = error.message && error.message.includes('rate limit')
+        ? 'The AI service is currently busy due to rate limits. Please wait a moment and try again.'
+        : error.message && error.message.includes('quota')
+        ? 'The AI service has reached its quota limit. Please try again later.'
+        : 'An error occurred while processing your request. Please try again.';
+      
+      reply.raw.write(`data: ${JSON.stringify({
+        type: 'error',
+        error: errorMessage,
+        is_complete: true
+      })}\n\n`);
+      
+      reply.raw.end();
     }
   });
 
-  console.log('✅ Simplified test agent routes registered');
+  console.log('✅ Streaming test agent routes registered');
 }
 
 // Ensure user is active member of organization

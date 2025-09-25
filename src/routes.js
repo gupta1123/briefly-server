@@ -4156,12 +4156,30 @@ export function registerRoutes(app) {
     const filename = sanitizeFilename(filePart.filename || 'upload.bin');
     const contentType = filePart.mimetype || 'application/octet-stream';
     const storageKey = `${orgId}/${Date.now()}-${filename}`;
-    const buffer = await streamToBuffer(filePart.file);
+    
+    // ✅ OPTIMIZED: Stream directly to Supabase without loading into memory
+    const { error } = await app.supabaseAdmin.storage
+      .from('documents')
+      .upload(storageKey, filePart.file, { 
+        contentType, 
+        upsert: false,
+        // Enable streaming for large files
+        cacheControl: '3600'
+      });
+    
+    if (error) {
+      req.log.error(error, 'Storage upload failed');
+      return reply.code(500).send({ error: 'Storage upload failed' });
+    }
 
-    const { error } = await app.supabaseAdmin.storage.from('documents').upload(storageKey, buffer, { contentType, upsert: false });
-    if (error) return reply.code(500).send({ error: 'Storage upload failed' });
+    // Get file size from Supabase metadata
+    const { data: fileInfo } = await app.supabaseAdmin.storage
+      .from('documents')
+      .list(orgId, { search: storageKey.split('/').pop() });
+    
+    const size = fileInfo?.[0]?.metadata?.size || 0;
 
-    return { storageKey, contentType, size: buffer.length };
+    return { storageKey, contentType, size };
   });
 
   app.post('/orgs/:orgId/uploads/sign', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {

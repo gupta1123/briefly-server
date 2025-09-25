@@ -48,7 +48,7 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
   if (responseJsonSchema) generationConfig.responseJsonSchema = responseJsonSchema;
 
   const model = genAI.getGenerativeModel({
-    model: 'models/gemini-1.5-flash',
+    model: 'models/gemini-2.0-flash',
     generationConfig,
   });
   const result = await model.generateContent([

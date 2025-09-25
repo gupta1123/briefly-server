@@ -6,6 +6,8 @@ export function loadEnv() {
     SUPABASE_JWT_SECRET,
     GEMINI_API_KEY,
     OPENAI_API_KEY,
+    AGNO_SERVICE_URL,
+    AGNO_SERVICE_TOKEN,
     PORT,
   } = process.env;
 
@@ -23,6 +25,8 @@ export function loadEnv() {
     SUPABASE_JWT_SECRET,
     GEMINI_API_KEY,
     OPENAI_API_KEY,
+    AGNO_SERVICE_URL,
+    AGNO_SERVICE_TOKEN,
     PORT: Number(PORT || 8787),
   };
 }

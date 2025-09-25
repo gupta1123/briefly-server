@@ -12,6 +12,40 @@ function sanitizeFilename(name) {
   }
 }
 
+// Batch processing multiple documents in parallel
+export async function ingestDocumentsBatch(app, documents) {
+  const log = app.log || console;
+  log.info({ count: documents.length }, 'Starting batch document ingestion');
+  
+  // Process documents in parallel (optimized for bulk uploads)
+  const BATCH_SIZE = 10; // Process 10 documents at once (max frontend limit)
+  const results = [];
+  
+  for (let i = 0; i < documents.length; i += BATCH_SIZE) {
+    const batch = documents.slice(i, i + BATCH_SIZE);
+    const batchPromises = batch.map(doc => 
+      ingestDocument(app, doc).catch(error => {
+        log.error({ orgId: doc.orgId, docId: doc.docId, error: error.message }, 'Batch ingestion failed for document');
+        return { error: error.message, docId: doc.docId };
+      })
+    );
+    
+    const batchResults = await Promise.allSettled(batchPromises);
+    results.push(...batchResults);
+    
+    // Small delay between batches to respect rate limits
+    if (i + BATCH_SIZE < documents.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  
+  const successful = results.filter(r => r.status === 'fulfilled' && !r.value?.error).length;
+  const failed = results.length - successful;
+  
+  log.info({ total: documents.length, successful, failed }, 'Batch ingestion completed');
+  return { successful, failed, results };
+}
+
 export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, geminiFile }) {
   const log = app.log || console;
   log.info({ orgId, docId, storageKey }, 'ingest start');
@@ -89,21 +123,24 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
   let metadata = {};
   let summaryText = '';
   try {
-    const ocr = await generateJsonFromGeminiFile({
-      fileUri: fileInfo.fileUri,
-      mimeType: fileInfo.mimeType || effectiveMime,
-      prompt: 'Extract readable text from the attached document. Prefer returning an array of pages when possible. Respond strictly as JSON in the form {"pages":[{"page":1,"text":"..."}],"extractedText":"..."}. If page-level text is not possible, supply extractedText only.',
-    });
-    const meta = await generateJsonFromGeminiFile({
-      fileUri: fileInfo.fileUri,
-      mimeType: fileInfo.mimeType || effectiveMime,
-      prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
-    });
-    const sum = await generateJsonFromGeminiFile({
-      fileUri: fileInfo.fileUri,
-      mimeType: fileInfo.mimeType || effectiveMime,
-      prompt: `${orgSummaryPrompt}\n\nRespond strictly as JSON with key "summary" containing the summary string.`,
-    });
+    // Process all Gemini calls in parallel for 3x speed improvement
+    const [ocr, meta, sum] = await Promise.all([
+      generateJsonFromGeminiFile({
+        fileUri: fileInfo.fileUri,
+        mimeType: fileInfo.mimeType || effectiveMime,
+        prompt: 'Extract readable text from the attached document. Prefer returning an array of pages when possible. Respond strictly as JSON in the form {"pages":[{"page":1,"text":"..."}],"extractedText":"..."}. If page-level text is not possible, supply extractedText only.',
+      }),
+      generateJsonFromGeminiFile({
+        fileUri: fileInfo.fileUri,
+        mimeType: fileInfo.mimeType || effectiveMime,
+        prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
+      }),
+      generateJsonFromGeminiFile({
+        fileUri: fileInfo.fileUri,
+        mimeType: fileInfo.mimeType || effectiveMime,
+        prompt: `${orgSummaryPrompt}\n\nRespond strictly as JSON with key "summary" containing the summary string.`,
+      })
+    ]);
 
     ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
     ocrText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0

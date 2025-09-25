@@ -208,32 +208,33 @@ async function performUploadAnalysis(app, { orgId, storageKey, mimeType }) {
   }
 
   try {
-    const ocr = await generateJsonFromGeminiFile({
-      fileUri: geminiReference.fileUri,
-      mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: 'Extract readable text from the document. Prefer returning text per page when possible. Always produce JSON that satisfies the provided schema. Provide concatenated text in extractedText when feasible.',
-      responseSchema: GEMINI_OCR_SCHEMA,
-    });
-
-    const meta = await generateJsonFromGeminiFile({
-      fileUri: geminiReference.fileUri,
-      mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
-      responseSchema: {
-        ...GEMINI_META_SCHEMA,
-        properties: {
-          ...GEMINI_META_SCHEMA.properties,
-          category: { type: 'string', enum: availableCategories },
+    // Process all Gemini calls in parallel for 3x speed improvement
+    const [ocr, meta, sum] = await Promise.all([
+      generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: 'Extract readable text from the document. Prefer returning text per page when possible. Always produce JSON that satisfies the provided schema. Provide concatenated text in extractedText when feasible.',
+        responseSchema: GEMINI_OCR_SCHEMA,
+      }),
+      generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
+        responseSchema: {
+          ...GEMINI_META_SCHEMA,
+          properties: {
+            ...GEMINI_META_SCHEMA.properties,
+            category: { type: 'string', enum: availableCategories },
+          },
         },
-      },
-    });
-
-    const sum = await generateJsonFromGeminiFile({
-      fileUri: geminiReference.fileUri,
-      mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: `${orgSummaryPrompt}\n\nReturn JSON compliant with the provided schema only.`,
-      responseSchema: GEMINI_SUMMARY_SCHEMA,
-    });
+      }),
+      generateJsonFromGeminiFile({
+        fileUri: geminiReference.fileUri,
+        mimeType: geminiReference.mimeType || effectiveMime,
+        prompt: `${orgSummaryPrompt}\n\nReturn JSON compliant with the provided schema only.`,
+        responseSchema: GEMINI_SUMMARY_SCHEMA,
+      })
+    ]);
 
     const ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
     const extractedText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0

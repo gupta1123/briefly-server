@@ -5,6 +5,7 @@ import { registerDashboardRoutes } from './dashboard.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerAgentRoutes } from './agents.js';
 import { registerTestAgentRoutes } from './test-agent.js';
+import { registerStreamingTestAgentRoutes } from './test-agent-streaming.js';
 
 /**
  * Register all route modules with the app
@@ -22,6 +23,9 @@ export function registerAllRoutes(app) {
 
   // Register test agent routes
   registerTestAgentRoutes(app);
+
+  // Register streaming test agent routes
+  registerStreamingTestAgentRoutes(app);
 
   // Add new route modules here as you create them:
   // registerAnalyticsRoutes(app);
