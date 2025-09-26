@@ -10,13 +10,8 @@ const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON 
 let genAI = null;
 let fileManager = null;
 
-// Initialize Gemini client
-if (API_KEY) {
-  // Try API key first (for backward compatibility)
-  genAI = new GoogleGenerativeAI(API_KEY);
-  fileManager = new GoogleAIFileManager(API_KEY);
-  console.info('Using API key authentication');
-} else if (GOOGLE_CREDENTIALS_JSON) {
+// Initialize Gemini client - OAuth2 takes priority for Files API
+if (GOOGLE_CREDENTIALS_JSON) {
   try {
     // Parse OAuth2 credentials
     const credentials = typeof GOOGLE_CREDENTIALS_JSON === 'string' 
@@ -35,7 +30,18 @@ if (API_KEY) {
     console.info('Using OAuth2 service account authentication');
   } catch (error) {
     console.error('Failed to initialize OAuth2 credentials:', error.message);
+    // Fall back to API key if OAuth2 fails
+    if (API_KEY) {
+      genAI = new GoogleGenerativeAI(API_KEY);
+      fileManager = new GoogleAIFileManager(API_KEY);
+      console.info('Using API key authentication (fallback)');
+    }
   }
+} else if (API_KEY) {
+  // Fall back to API key if no OAuth2 credentials
+  genAI = new GoogleGenerativeAI(API_KEY);
+  fileManager = new GoogleAIFileManager(API_KEY);
+  console.info('Using API key authentication');
 }
 
 if (!genAI || !fileManager) {
