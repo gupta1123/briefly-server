@@ -4160,26 +4160,19 @@ export function registerRoutes(app) {
     // ✅ OPTIMIZED: Stream directly to Supabase without loading into memory
     const { error } = await app.supabaseAdmin.storage
       .from('documents')
-      .upload(storageKey, filePart.file, { 
-        contentType, 
+      .upload(storageKey, filePart.file, {
+        contentType,
         upsert: false,
-        // Enable streaming for large files
+        // Enable streaming for large files where supported
         cacheControl: '3600'
       });
-    
+
     if (error) {
       req.log.error(error, 'Storage upload failed');
       return reply.code(500).send({ error: 'Storage upload failed' });
     }
 
-    // Get file size from Supabase metadata
-    const { data: fileInfo } = await app.supabaseAdmin.storage
-      .from('documents')
-      .list(orgId, { search: storageKey.split('/').pop() });
-    
-    const size = fileInfo?.[0]?.metadata?.size || 0;
-
-    return { storageKey, contentType, size };
+    return { storageKey, contentType };
   });
 
   app.post('/orgs/:orgId/uploads/sign', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
@@ -4198,7 +4191,7 @@ export function registerRoutes(app) {
           .eq('org_id', orgId)
           .eq('user_id', userId)
           .maybeSingle();
-        
+
         if (userRole?.role === 'teamLead') {
           // Allow team leads to upload (they should have this permission anyway)
           req.log.info('Allowing upload for team lead due to auth context issue');
@@ -4209,12 +4202,25 @@ export function registerRoutes(app) {
         throw error; // Re-throw original permission error
       }
     }
-    const Schema = z.object({ filename: z.string(), mimeType: z.string().optional(), contentHash: z.string().optional() });
+    const Schema = z.object({
+      filename: z.string(),
+      mimeType: z.string().optional(),
+      contentHash: z.string().optional(),
+    });
     const body = Schema.parse(req.body);
+
+    // Original signed URL approach for backward compatibility
     const key = `${orgId}/${Date.now()}-${sanitizeFilename(body.filename)}`;
     const { data, error } = await app.supabaseAdmin.storage.from('documents').createSignedUploadUrl(key);
     if (error) throw error;
-    return { url: data.signedUrl, storageKey: key, path: data.path, token: data.token };
+    return {
+      uploadType: 'direct',
+      signedUrl: data.signedUrl,
+      storageKey: key,
+      path: data.path,
+      token: data.token,
+      expiresAt: data.expiresAt || null,
+    };
   });
 
   // Chat Orchestrator (SSE) — router → retrieval → rerank → answer → citations

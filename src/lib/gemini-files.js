@@ -98,11 +98,11 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
     const firstBrace = trimmed.indexOf('{');
     const lastBrace = trimmed.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1 && firstBrace < lastBrace) {
-    const candidate = trimmed.slice(firstBrace, lastBrace + 1);
-    try {
-      return tryParse(candidate);
-    } catch {}
-  }
+      const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+      try {
+        return tryParse(candidate);
+      } catch {}
+    }
 
     // Fallback: Gemini sometimes returns multiple JSON objects separated by commas.
     try {
@@ -117,16 +117,18 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
       return tryParse(jsonrepair(trimmed));
     } catch {}
 
-  return null;
-};
+    return null;
+  };
 
-const parsed = parseJsonSafely(raw);
+  const parsed = parseJsonSafely(raw);
   if (parsed !== null) {
     return parsed;
   }
 
   console.error('Gemini JSON parse failure. Response was:', raw);
-  throw new SyntaxError('Gemini returned non-JSON response');
+  const error = new SyntaxError('Gemini returned non-JSON response');
+  error.rawResponse = raw;
+  throw error;
 }
 
 export function hasGeminiClient() {

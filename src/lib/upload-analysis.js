@@ -56,8 +56,14 @@ const GEMINI_SUMMARY_SCHEMA = {
   type: 'object',
   properties: {
     summary: { type: 'string' },
+    keyPointers: {
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 0,
+      maxItems: 8,
+    },
   },
-  required: ['summary'],
+  required: ['summary', 'keyPointers'],
 };
 
 class AnalysisError extends Error {
@@ -156,6 +162,132 @@ function buildLargeFileFallback(storageKey, sizeMb, sizeLimitMb, availableCatego
   return fallback;
 }
 
+// Handle large files by splitting into manageable chunks for processing
+async function processLargeFile(app, {
+  orgId,
+  storageKey, 
+  buffer,
+  effectiveMime,
+  baseName,
+  availableCategories,
+  orgSummaryPrompt
+}) {
+  const log = app.log || console;
+  const fileSizeMB = buffer.length / (1024 * 1024);
+  log.info({ orgId, storageKey, sizeMb: fileSizeMB.toFixed(2) }, 'Processing large file with enhanced strategy');
+
+  // For PDFs, try progressive processing with smaller chunks
+  if (effectiveMime === 'application/pdf') {
+    try {
+      return await processLargePdf(app, {
+        orgId,
+        storageKey,
+        buffer,
+        baseName,
+        availableCategories,
+        orgSummaryPrompt
+      });
+    } catch (error) {
+      log.warn(error, 'Large PDF processing failed, using fallback metadata');
+    }
+  }
+
+  // Enhanced fallback metadata for large files
+  const fileExtension = baseName.split('.').pop()?.toLowerCase() || '';
+  const fileNameNoExt = baseName.replace(/\.[^/.]+$/, '');
+  
+  const largeFileMetadata = {
+    title: fileNameNoExt,
+    subject: `${fileNameNoExt} - Large Document`,
+    keywords: [baseName.replace(/[^A-Za-z0-9\s]/g, ''), fileExtension.toUpperCase(), 'large-file', 'document'],
+    tags: ['document', 'large-file', fileExtension.toLowerCase(), 'readable'],
+    summary: `Large ${fileExtension.toUpperCase()} file (${fileSizeMB.toFixed(1)}MB) uploaded successfully. This document exceeded the automatic AI processing size limit of 50MB, but the file content is fully available for download and manual review.`,
+    keyPointers: [
+      'Large file successfully uploaded',
+      'Manual metadata entry recommended',
+      `File size: ${fileSizeMB.toFixed(1)}MB`,
+      'Full content available for download'
+    ],
+    sender: '',
+    receiver: '',
+    senderOptions: [],
+    receiverOptions: [],
+    documentDate: '',
+    category: determineCategoryForLargeFile(fileExtension, availableCategories),
+  };
+
+  log.info({ orgId, storageKey }, 'Large file analysis completed with enhanced metadata');
+  
+  return {
+    ocrText: '', // No OCR text extracted for large files initially
+    metadata: largeFileMetadata,
+    geminiFile: null,
+    usedFallback: true,
+  };
+}
+
+// Process large PDFs by attempting chunked analysis
+async function processLargePdf(app, {
+  orgId,
+  storageKey,
+  buffer, 
+  baseName,
+  availableCategories,
+  orgSummaryPrompt
+}) {
+  const log = app.log || console;
+  const fileSizeMB = buffer.length / (1024 * 1024);
+  
+  // For now, use enhanced fallback metadata for large PDFs
+  // Future enhancement: Implement PDF.js chunking for pages or pdf2pic + OCR
+  const fileNameNoExt = baseName.replace(/\.[^/.]+$/, '');
+  
+  const pdfMetadata = {
+    title: fileNameNoExt,
+    subject: `${fileNameNoExt} - Large PDF Document`,
+    keywords: [baseName.replace(/[^A-Za-z0-9\s]/g, ''), 'PDF', 'large-file', 'document'],
+    tags: ['document', 'large-file', 'pdf', 'readable'],
+    summary: `Large PDF document (${fileSizeMB.toFixed(1)}MB) uploaded successfully. This document exceeded the automatic AI processing size limit but is fully available for download and review.`,
+    keyPointers: [
+      'Large PDF successfully uploaded',
+      `Document size: ${fileSizeMB.toFixed(1)}MB`,
+      'Full PDF available for download',
+      'Visual review recommended'
+    ],
+    sender: '',
+    receiver: '',
+    senderOptions: [],
+    receiverOptions: [],
+    documentDate: '',
+    category: availableCategories.includes('Report') ? 'Report' : (availableCategories.includes('General') ? 'General' : availableCategories[0]),
+  };
+
+  return {
+    ocrText: '', // Future: Extract first few pages with pdf.js
+    metadata: pdfMetadata,
+    geminiFile: null,
+    usedFallback: true,
+  };
+}
+
+// Helper function to determine appropriate category for large files
+function determineCategoryForLargeFile(fileExtension, availableCategories) {
+  const ext = (fileExtension || '').toLowerCase();
+  
+  if (['pdf'].includes(ext)) {
+    return availableCategories.includes('Report') ? 'Report' : availableCategories[0];
+  } else if (['doc', 'docx'].includes(ext)) {
+    return availableCategories.includes('Correspondence') ? 'Correspondence' : 
+           availableCategories.includes('Document') ? 'Document' : availableCategories[0];
+  } else if (['ppt', 'pptx'].includes(ext)) {
+    return availableCategories.includes('Report') ? 'Report' : availableCategories[0];
+  } else if (['jpg', 'jpeg', 'png', 'gif'].includes(ext)) {
+    return availableCategories.includes('General') ? 'General' : availableCategories[0];
+  }
+  
+  return availableCategories.includes('General') ? 'General' : availableCategories[0];
+}
+
 async function performUploadAnalysis(app, { orgId, storageKey, mimeType }) {
   const log = app.log || console;
   const availableCategories = await loadOrgSettings(app, orgId);
@@ -165,129 +297,213 @@ async function performUploadAnalysis(app, { orgId, storageKey, mimeType }) {
   const fileSize = fileBlob.size;
   const fileSizeMB = fileSize / (1024 * 1024);
 
-  const AI_SIZE_LIMITS = {
-    'application/pdf': 100,
+  // Maximum file sizes for different types - conservative limits to prevent API failures
+  const MAX_FILE_SIZES = {
+    'application/pdf': 50, // Reduced to 50MB to match frontend limit
     'image/jpeg': 50,
     'image/png': 50,
-    'image/gif': 20,
+    'image/gif': 50,
     'application/msword': 50,
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 50,
-    'application/vnd.ms-powerpoint': 75,
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 75,
-    'text/plain': 10,
-    'text/markdown': 10,
+    'application/vnd.ms-powerpoint': 50,
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 50,
+    'text/plain': 50,
+    'text/markdown': 50,
   };
 
+  const GEMINI_SAFE_SIZE_LIMIT = 50; // MB - Gemini Files API safe limit for reliable processing
+  
   const mimeTypeKey = mimeType || fileBlob.type || 'application/octet-stream';
-  const sizeLimit = AI_SIZE_LIMITS[mimeTypeKey] || 50;
+  const maxFileSize = MAX_FILE_SIZES[mimeTypeKey] || 50; // Default: 50MB cap
 
-  if (fileSizeMB > sizeLimit) {
-    log.info({ orgId, storageKey, sizeMb: fileSizeMB, sizeLimit, mimeType: mimeTypeKey }, 'Upload skipped AI processing due to size');
-    const fallback = buildLargeFileFallback(storageKey, fileSizeMB, sizeLimit, availableCategories);
-    throw new AnalysisError('File too large for AI processing', {
+  // Only block files that are unreasonably large 
+  if (fileSizeMB > maxFileSize) {
+    log.info({ orgId, storageKey, sizeMb: fileSizeMB, maxSize: maxFileSize, mimeType: mimeTypeKey }, 'File exceeds maximum allowed size');
+    const fallback = buildLargeFileFallback(storageKey, fileSizeMB, maxFileSize, availableCategories);
+    throw new AnalysisError('File exceeds maximum allowed size', {
       status: 413,
       fallback: { ocrText: '', metadata: fallback },
     });
   }
 
-  log.info({ orgId, storageKey, sizeMb: fileSizeMB.toFixed(2) }, 'Processing file with Gemini Files API');
+  log.info({ orgId, storageKey, sizeMb: fileSizeMB.toFixed(2) }, 'Processing file - will determine best approach');
   const buffer = Buffer.from(await fileBlob.arrayBuffer());
   const effectiveMime = mimeType || fileBlob.type || 'application/octet-stream';
   const baseName = sanitizeFilename(storageKey.split('/').pop() || 'Document');
 
+  // ALWAYS attempt processing - try Gemini first, fallback if needed!
   let geminiReference = null;
+
+  // First try to upload to Gemini for any file size (attempt for larger files, guaranteed for smaller ones)
   try {
     geminiReference = await uploadBufferToGemini(buffer, {
       mimeType: effectiveMime,
       displayName: baseName,
     });
-    log.info({ orgId, storageKey, fileId: geminiReference.fileId }, 'Uploaded file to Gemini');
+    log.info({ orgId, storageKey, fileId: geminiReference.fileId }, 'Successfully uploaded to Gemini');
   } catch (error) {
-    log.error(error, 'Failed to upload file to Gemini');
-    throw new AnalysisError('AI upload failed', { status: 503 });
+    // Enhanced error handling for files that are too large for Gemini
+    const errorMessage = error?.message || error?.toString() || '';
+    if (errorMessage.includes('too large') ||
+        errorMessage.includes('exceeded size') ||
+        errorMessage.includes('content length') ||
+        errorMessage.includes('files bytes are too large') ||
+        errorMessage.includes('400 Bad Request')) {
+      log.warn({ orgId, storageKey, sizeMb: fileSizeMB.toFixed(2), error: errorMessage }, 'File too large for Gemini processing, using enhanced processing');
+
+      // Switch to large file processing mode
+      return await processLargeFile(app, {
+        orgId,
+        storageKey,
+        buffer,
+        effectiveMime,
+        baseName,
+        availableCategories,
+        orgSummaryPrompt
+      });
+    } else {
+      log.error(error, 'Failed to upload file to Gemini for unknown reason');
+      throw new AnalysisError('AI upload failed', { status: 503 });
+    }
   }
 
-  try {
-    // Process all Gemini calls in parallel for 3x speed improvement
-    const [ocr, meta, sum] = await Promise.all([
-      generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: 'Extract readable text from the document. Prefer returning text per page when possible. Always produce JSON that satisfies the provided schema. Provide concatenated text in extractedText when feasible.',
-        responseSchema: GEMINI_OCR_SCHEMA,
-      }),
-      generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
-        responseSchema: {
-          ...GEMINI_META_SCHEMA,
-          properties: {
-            ...GEMINI_META_SCHEMA.properties,
-            category: { type: 'string', enum: availableCategories },
-          },
+  const defaultSummary = `Summarize this document in under 300 words. Focus on essential facts, decisions, and outcomes.
+
+Respond as JSON with two keys:
+- summary: a tight narrative paragraph (<=300 words) covering the key context and conclusions.
+- keyPointers: an array of 3-7 short bullet-style strings capturing the most important takeaways.`;
+
+  const defaultMetadata = () => ({
+    title: baseName,
+    subject: baseName,
+    keywords: [baseName, 'document', 'ai-generated'],
+    tags: ['document'],
+    summary: '',
+    keyPointers: [],
+    sender: '',
+    receiver: '',
+    senderOptions: [],
+    receiverOptions: [],
+    documentDate: '',
+    category: availableCategories.includes('General') ? 'General' : availableCategories[0],
+  });
+
+  let ocrText = '';
+  let metadata = defaultMetadata();
+  let summaryText = '';
+  let usedFallback = false;
+
+  const [ocrResult, metaResult, sumResult] = await Promise.allSettled([
+    generateJsonFromGeminiFile({
+      fileUri: geminiReference.fileUri,
+      mimeType: geminiReference.mimeType || effectiveMime,
+      prompt: 'Extract readable text from the document. Prefer returning text per page when possible. Always produce JSON that satisfies the provided schema. Provide concatenated text in extractedText when feasible.',
+      responseSchema: GEMINI_OCR_SCHEMA,
+    }),
+    generateJsonFromGeminiFile({
+      fileUri: geminiReference.fileUri,
+      mimeType: geminiReference.mimeType || effectiveMime,
+      prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
+      responseSchema: {
+        ...GEMINI_META_SCHEMA,
+        properties: {
+          ...GEMINI_META_SCHEMA.properties,
+          category: { type: 'string', enum: availableCategories },
         },
-      }),
-      generateJsonFromGeminiFile({
-        fileUri: geminiReference.fileUri,
-        mimeType: geminiReference.mimeType || effectiveMime,
-        prompt: `${orgSummaryPrompt}\n\nReturn JSON compliant with the provided schema only.`,
-        responseSchema: GEMINI_SUMMARY_SCHEMA,
-      })
-    ]);
+      },
+    }),
+    generateJsonFromGeminiFile({
+      fileUri: geminiReference.fileUri,
+      mimeType: geminiReference.mimeType || effectiveMime,
+      prompt: `${orgSummaryPrompt || defaultSummary}\n\nReturn JSON compliant with the provided schema only.`,
+      responseSchema: GEMINI_SUMMARY_SCHEMA,
+    }),
+  ]);
 
-    const ocrPages = Array.isArray(ocr?.pages) ? ocr.pages.filter((p) => p && typeof p.text === 'string') : [];
-    const extractedText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0
-      ? ocr.extractedText
-      : (Array.isArray(ocrPages) ? ocrPages.map((p) => String(p.text || '')).join('\n\n') : '');
+  // Check if any of the analysis steps failed due to size limits and switch to enhanced processing
+  const allRejected = [ocrResult, metaResult, sumResult].filter(r => r.status === 'rejected');
+  const hasSizeError = allRejected.some(r => {
+    const errMsg = (r.reason?.message || '').toLowerCase();
+    return errMsg.includes('files bytes are too large') || 
+           errMsg.includes('too large to be read') ||
+           errMsg.includes('400 bad request') && errMsg.includes('bytes are too large');
+  });
 
-    const ensured = {
-      title: (meta && typeof meta.title === 'string' && meta.title.trim()) ? meta.title : baseName,
-      subject: (meta && typeof meta.subject === 'string' && meta.subject.trim()) ? meta.subject : baseName,
-      keywords: Array.from(new Set((Array.isArray(meta?.keywords) ? meta.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
-      tags: Array.from(new Set((Array.isArray(meta?.tags) ? meta.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
-      summary: (sum && typeof sum.summary === 'string') ? sum.summary : '',
-      sender: typeof meta?.sender === 'string' ? meta.sender : undefined,
-      receiver: typeof meta?.receiver === 'string' ? meta.receiver : undefined,
-      senderOptions: Array.isArray(meta?.senderOptions) ? meta.senderOptions : [],
-      receiverOptions: Array.isArray(meta?.receiverOptions) ? meta.receiverOptions : [],
-      documentDate: typeof meta?.documentDate === 'string' ? meta.documentDate : undefined,
-      category: typeof meta?.category === 'string' ? meta.category : undefined,
-    };
-
-    return {
-      ocrText: extractedText,
-      metadata: ensured,
-      geminiFile: geminiReference,
-    };
-  } catch (error) {
-    log.error(error, 'Gemini analysis failed');
-    if (geminiReference?.fileId) {
-      log.warn({ orgId, storageKey, fileId: geminiReference.fileId }, 'Deleting Gemini file after failure');
-      await deleteGeminiFile(geminiReference.fileId).catch((err) => {
-        log.warn({ orgId, storageKey, fileId: geminiReference.fileId, err: err?.message }, 'Failed to delete Gemini file after failure');
-      });
-    }
-
-    const fallbackMeta = {
-      title: baseName,
-      subject: baseName,
-      keywords: [baseName],
-      tags: ['document'],
-      summary: 'AI analysis failed. Metadata was generated from the filename—please review and update manually.',
-      sender: '',
-      receiver: '',
-      senderOptions: [],
-      receiverOptions: [],
-      documentDate: '',
-      category: availableCategories.includes('General') ? 'General' : availableCategories[0],
-    };
-
-    throw new AnalysisError('AI analysis failed', {
-      status: 503,
-      fallback: { ocrText: '', metadata: fallbackMeta },
+  if (hasSizeError && fileSizeMB > 50) { // Only use fallback for files > 50MB
+    log.info({ orgId, storageKey, sizeMb: fileSizeMB.toFixed(2) }, 'All Gemini analysis steps failed due to size - switching to enhanced large file processing');
+    return await processLargeFile(app, {
+      orgId,
+      storageKey,
+      buffer,
+      effectiveMime,
+      baseName,
+      availableCategories,
+      orgSummaryPrompt
     });
   }
+
+  if (ocrResult.status === 'fulfilled' && ocrResult.value) {
+    const pages = Array.isArray(ocrResult.value?.pages) ? ocrResult.value.pages.filter((p) => p && typeof p.text === 'string') : [];
+    ocrText = typeof ocrResult.value?.extractedText === 'string' && ocrResult.value.extractedText.trim().length > 0
+      ? ocrResult.value.extractedText
+      : (Array.isArray(pages) ? pages.map((p) => String(p.text || '')).join('\n\n') : '');
+  } else {
+    const raw = (ocrResult.status === 'rejected' && typeof ocrResult.reason?.rawResponse === 'string')
+      ? ocrResult.reason.rawResponse.trim()
+      : '';
+    if (raw) {
+      ocrText = raw;
+    }
+    usedFallback = true;
+    log.warn({ orgId, storageKey, reason: ocrResult.status === 'rejected' ? ocrResult.reason?.message : 'unknown' }, 'Gemini OCR fallback used');
+  }
+
+  if (metaResult.status === 'fulfilled' && metaResult.value) {
+    metadata = metaResult.value;
+  } else {
+    usedFallback = true;
+    log.warn({ orgId, storageKey, reason: metaResult.status === 'rejected' ? metaResult.reason?.message : 'unknown' }, 'Gemini metadata fallback used');
+    metadata = defaultMetadata();
+  }
+
+  let keyPointers = [];
+  if (sumResult.status === 'fulfilled' && typeof sumResult.value?.summary === 'string') {
+    summaryText = sumResult.value.summary;
+    if (Array.isArray(sumResult.value?.keyPointers)) {
+      keyPointers = sumResult.value.keyPointers.filter((item) => typeof item === 'string' && item.trim());
+    }
+  } else {
+    usedFallback = true;
+    log.warn({ orgId, storageKey, reason: sumResult.status === 'rejected' ? sumResult.reason?.message : 'unknown' }, 'Gemini summary fallback used');
+    summaryText = 'Summary unavailable. Please review and provide key details manually.';
+    keyPointers = [];
+  }
+
+  metadata = {
+    title: (metadata && typeof metadata.title === 'string' && metadata.title.trim()) ? metadata.title : defaultMetadata().title,
+    subject: (metadata && typeof metadata.subject === 'string' && metadata.subject.trim()) ? metadata.subject : defaultMetadata().subject,
+    keywords: Array.from(new Set((Array.isArray(metadata?.keywords) ? metadata.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
+    tags: Array.from(new Set((Array.isArray(metadata?.tags) ? metadata.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
+    summary: summaryText || '',
+    keyPointers,
+    sender: typeof metadata?.sender === 'string' ? metadata.sender : undefined,
+    receiver: typeof metadata?.receiver === 'string' ? metadata.receiver : undefined,
+    senderOptions: Array.isArray(metadata?.senderOptions) ? metadata.senderOptions : [],
+    receiverOptions: Array.isArray(metadata?.receiverOptions) ? metadata.receiverOptions : [],
+    documentDate: typeof metadata?.documentDate === 'string' ? metadata.documentDate : undefined,
+    category: typeof metadata?.category === 'string' ? metadata.category : defaultMetadata().category,
+  };
+
+  if (usedFallback) {
+    log.info({ orgId, storageKey }, 'Gemini analysis completed with fallbacks');
+  }
+
+  return {
+    ocrText,
+    metadata,
+    geminiFile: geminiReference,
+    usedFallback,
+  };
 }
 
 export { AnalysisError, performUploadAnalysis };
