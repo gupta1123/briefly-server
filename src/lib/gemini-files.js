@@ -10,42 +10,37 @@ const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON 
 let genAI = null;
 let fileManager = null;
 
-// Initialize Gemini client - OAuth2 takes priority for Files API
+// Check for OAuth2 and initialize accordingly  
 if (GOOGLE_CREDENTIALS_JSON) {
+  console.info('OAuth2 credentials found - configuring service account authentication');
   try {
-    // Parse OAuth2 credentials
     const credentials = typeof GOOGLE_CREDENTIALS_JSON === 'string' 
       ? JSON.parse(GOOGLE_CREDENTIALS_JSON)
       : GOOGLE_CREDENTIALS_JSON;
     
-    // Create auth client for OAuth2
-    const authClient = new GoogleAuth({
-      credentials: credentials,
-      scopes: ['https://www.googleapis.com/auth/generative-language.retriever']
-    });
+    // Set credentials as Google Default Application Credentials
+    // This is the standard way for service account authentication
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = Buffer.from(JSON.stringify(credentials)).toString('base64');
     
-    // Initialize with OAuth2
-    genAI = new GoogleGenerativeAI({ auth: authClient });
-    fileManager = new GoogleAIFileManager({ auth: authClient });
+    // Disable API key to force OAuth2
+    genAI = new GoogleGenerativeAI();
+    fileManager = new GoogleAIFileManager('');
+    
     console.info('Using OAuth2 service account authentication');
   } catch (error) {
-    console.error('Failed to initialize OAuth2 credentials:', error.message);
-    // Fall back to API key if OAuth2 fails
-    if (API_KEY) {
-      genAI = new GoogleGenerativeAI(API_KEY);
-      fileManager = new GoogleAIFileManager(API_KEY);
-      console.info('Using API key authentication (fallback)');
-    }
+    console.error('OAuth2 initialization error:', error.message);
   }
-} else if (API_KEY) {
-  // Fall back to API key if no OAuth2 credentials
+}
+
+// Fall back to API key if OAuth2 failed or not available
+if (!genAI && API_KEY) {
   genAI = new GoogleGenerativeAI(API_KEY);
   fileManager = new GoogleAIFileManager(API_KEY);
   console.info('Using API key authentication');
 }
 
 if (!genAI || !fileManager) {
-  console.warn('Gemini client not configured. Provide either GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS_JSON.');
+  console.warn('Gemini client not configured. Check credentials.');
 }
 
 export async function uploadBufferToGemini(buffer, { mimeType, displayName }) {
@@ -171,3 +166,4 @@ export async function generateJsonFromGeminiFile({ fileUri, mimeType, prompt, re
 export function hasGeminiClient() {
   return Boolean(genAI && fileManager);
 }
+
