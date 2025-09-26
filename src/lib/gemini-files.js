@@ -18,15 +18,17 @@ if (GOOGLE_CREDENTIALS_JSON) {
       ? JSON.parse(GOOGLE_CREDENTIALS_JSON)
       : GOOGLE_CREDENTIALS_JSON;
     
-    // Set credentials as Google Default Application Credentials
-    // This is the standard way for service account authentication
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = Buffer.from(JSON.stringify(credentials)).toString('base64');
+    const projectId = credentials.project_id;
+    console.info(`OAuth2 credentials project ID: ${projectId}`);
     
-    // Disable API key to force OAuth2
-    genAI = new GoogleGenerativeAI();
+    // Set as temporary file for Google application discovery process
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON = JSON.stringify(credentials);
+    
+    // Initialize OAuth2 
+    genAI = new GoogleGenerativeAI('');
     fileManager = new GoogleAIFileManager('');
     
-    console.info('Using OAuth2 service account authentication');
+    console.info(`Using OAuth2 service account authentication for project: ${projectId}`);
   } catch (error) {
     console.error('OAuth2 initialization error:', error.message);
   }
