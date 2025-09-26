@@ -1,15 +1,46 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { GoogleAIFileManager } from '@google/generative-ai/server';
 import { jsonrepair } from 'jsonrepair';
+import { GoogleAuth } from 'google-auth-library';
 
+// Support both API key and OAuth2 credentials
 const API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS || '';
 
-if (!API_KEY) {
-  console.warn('Gemini API key not configured. Calls will fail until GEMINI_API_KEY or GOOGLE_API_KEY is set.');
+let genAI = null;
+let fileManager = null;
+
+// Initialize Gemini client
+if (API_KEY) {
+  // Try API key first (for backward compatibility)
+  genAI = new GoogleGenerativeAI(API_KEY);
+  fileManager = new GoogleAIFileManager(API_KEY);
+  console.info('Using API key authentication');
+} else if (GOOGLE_CREDENTIALS_JSON) {
+  try {
+    // Parse OAuth2 credentials
+    const credentials = typeof GOOGLE_CREDENTIALS_JSON === 'string' 
+      ? JSON.parse(GOOGLE_CREDENTIALS_JSON)
+      : GOOGLE_CREDENTIALS_JSON;
+    
+    // Create auth client for OAuth2
+    const authClient = new GoogleAuth({
+      credentials: credentials,
+      scopes: ['https://www.googleapis.com/auth/generative-language.retriever']
+    });
+    
+    // Initialize with OAuth2
+    genAI = new GoogleGenerativeAI({ auth: authClient });
+    fileManager = new GoogleAIFileManager({ auth: authClient });
+    console.info('Using OAuth2 service account authentication');
+  } catch (error) {
+    console.error('Failed to initialize OAuth2 credentials:', error.message);
+  }
 }
 
-const genAI = API_KEY ? new GoogleGenerativeAI(API_KEY) : null;
-const fileManager = API_KEY ? new GoogleAIFileManager(API_KEY) : null;
+if (!genAI || !fileManager) {
+  console.warn('Gemini client not configured. Provide either GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS_JSON.');
+}
 
 export async function uploadBufferToGemini(buffer, { mimeType, displayName }) {
   if (!fileManager) throw new Error('Gemini FileManager not configured');
