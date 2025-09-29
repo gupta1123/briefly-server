@@ -12,7 +12,185 @@ import { isAIDegraded, generateDegradedResponse } from '../lib/graceful-degradat
 export function registerStreamingTestAgentRoutes(app) {
   console.log('🌊 Registering streaming test agent routes...');
 
-  // Streaming chat endpoint with Server-Sent Events
+  // Document-specific streaming chat endpoint
+  app.post('/orgs/:orgId/chat/document/:documentId/stream', {
+    preHandler: [app.verifyAuth, app.requireIpAccess]
+  }, async (req, reply) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    const documentId = req.params.documentId;
+
+    const Schema = z.object({
+      question: z.string().min(1),
+      conversation: z
+        .array(z.object({
+          role: z.enum(['user', 'assistant']).optional(),
+          content: z.string().optional(),
+          citations: z.array(z.object({ docId: z.string().optional() })).optional(),
+        }))
+        .optional(),
+      memory: z
+        .object({
+          focusDocIds: z.array(z.string()).optional(),
+          lastCitedDocIds: z.array(z.string()).optional(),
+          lastListDocIds: z.array(z.string()).optional(),
+          sessionId: z.string().optional(),
+        })
+        .optional(),
+      filters: z.object({
+        sender: z.string().optional(),
+        receiver: z.string().optional(),
+        docType: z.string().optional(),
+        category: z.string().optional(),
+      }).optional(),
+      strictCitations: z.boolean().optional(),
+    });
+
+    const { question, conversation = [], memory: userMemory = {}, filters = {}, strictCitations } = Schema.parse(req.body || {});
+
+    try {
+      const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
+      
+      // Set up SSE
+      reply.raw.setHeader('Content-Type', 'text/event-stream');
+      reply.raw.setHeader('Cache-Control', 'no-cache');
+      reply.raw.setHeader('Connection', 'keep-alive');
+      reply.raw.setHeader('Access-Control-Allow-Origin', '*');
+      
+      const sendSSE = (data) => {
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // Send initial event
+      sendSSE({ type: 'start', ok: true });
+
+      // Call Agno service with document context
+      const agnoContext = {
+        scope: 'doc',
+        docId: documentId,
+        includeSubfolders: false,
+        includeLinked: false,
+        includeVersions: false,
+      };
+
+      const agnoParams = {
+        orgId,
+        userId,
+        question,
+        conversation,
+        memory: normalizedMemory,
+        context: agnoContext,
+        filters,
+        strictCitations,
+      };
+
+      // Stream response from Agno service
+      for await (const chunk of callAgnoChatStream(agnoParams)) {
+        sendSSE(chunk);
+      }
+
+      // Send completion event
+      sendSSE({ type: 'complete', ok: true });
+      
+    } catch (error) {
+      console.error('Document streaming chat error:', error);
+      reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+    } finally {
+      reply.raw.end();
+    }
+  });
+
+  // Folder-specific streaming chat endpoint
+  app.post('/orgs/:orgId/chat/folder/:folderId/stream', {
+    preHandler: [app.verifyAuth, app.requireIpAccess]
+  }, async (req, reply) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    const folderId = req.params.folderId;
+
+    const Schema = z.object({
+      question: z.string().min(1),
+      conversation: z
+        .array(z.object({
+          role: z.enum(['user', 'assistant']).optional(),
+          content: z.string().optional(),
+          citations: z.array(z.object({ docId: z.string().optional() })).optional(),
+        }))
+        .optional(),
+      memory: z
+        .object({
+          focusDocIds: z.array(z.string()).optional(),
+          lastCitedDocIds: z.array(z.string()).optional(),
+          lastListDocIds: z.array(z.string()).optional(),
+          sessionId: z.string().optional(),
+        })
+        .optional(),
+      filters: z.object({
+        sender: z.string().optional(),
+        receiver: z.string().optional(),
+        docType: z.string().optional(),
+        category: z.string().optional(),
+      }).optional(),
+      strictCitations: z.boolean().optional(),
+    });
+
+    const { question, conversation = [], memory: userMemory = {}, filters = {}, strictCitations } = Schema.parse(req.body || {});
+
+    try {
+      const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
+      
+      // Set up SSE
+      reply.raw.setHeader('Content-Type', 'text/event-stream');
+      reply.raw.setHeader('Cache-Control', 'no-cache');
+      reply.raw.setHeader('Connection', 'keep-alive');
+      reply.raw.setHeader('Access-Control-Allow-Origin', '*');
+      
+      const sendSSE = (data) => {
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // Send initial event
+      sendSSE({ type: 'start', ok: true });
+
+      // Call Agno service with folder context
+      const agnoContext = {
+        scope: 'folder',
+        folderId: folderId,
+        includeSubfolders: true,
+        includeLinked: false,
+        includeVersions: false,
+      };
+
+      const agnoParams = {
+        orgId,
+        userId,
+        question,
+        conversation,
+        memory: normalizedMemory,
+        context: agnoContext,
+        filters,
+        strictCitations,
+      };
+
+      // Stream response from Agno service
+      for await (const chunk of callAgnoChatStream(agnoParams)) {
+        sendSSE(chunk);
+      }
+
+      // Send completion event
+      sendSSE({ type: 'complete', ok: true });
+      
+    } catch (error) {
+      console.error('Folder streaming chat error:', error);
+      reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+    } finally {
+      reply.raw.end();
+    }
+  });
+
+  // Organization-wide streaming chat endpoint with Server-Sent Events
   app.post('/orgs/:orgId/chat/stream', {
     preHandler: [app.verifyAuth, app.requireIpAccess]
   }, async (req, reply) => {
@@ -286,3 +464,4 @@ async function ensureActiveMember(req) {
   }
   return String(orgId);
 }
+

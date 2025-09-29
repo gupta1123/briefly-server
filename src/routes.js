@@ -2063,7 +2063,7 @@ export function registerRoutes(app) {
     console.log('Documents endpoint called for org:', req.params.orgId, 'user:', req.user?.sub, 'query:', req.query);
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    const { q, limit = 50, offset = 0, departmentId } = req.query || {};
+    const { q, limit = 10000, offset = 0, departmentId } = req.query || {};
     const userId = req.user?.sub;
     
     // Build documents query
@@ -2084,7 +2084,7 @@ export function registerRoutes(app) {
       .select('id, org_id, title, filename, type, folder_path, subject, description, category, tags, keywords, sender, receiver, document_date, uploaded_at, file_size_bytes, mime_type, content_hash, storage_key, department_id, version_group_id, version_number, is_current_version, supersedes_id, deleted_at, purge_after')
       .eq('org_id', orgId)
       .order('uploaded_at', { ascending: false })
-      .range(offset, offset + Math.min(Number(limit), 200) - 1);
+      .range(offset, offset + Number(limit) - 1);
 
     // Apply folder filter
     query = query.filter('type', 'neq', 'folder');
