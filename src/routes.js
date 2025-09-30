@@ -3198,6 +3198,77 @@ export function registerRoutes(app) {
     return { success: true, folder_path: data.folder_path };
   });
 
+  // Get folder ID from folder path
+  app.get('/orgs/:orgId/folders/resolve-id', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    const pathStr = String((req.query?.path || ''));
+    const pathArr = pathStr ? pathStr.split('/').filter(Boolean) : [];
+    
+    console.log('🔍 Folder resolution request:', { pathStr, pathArr, orgId });
+
+    if (pathArr.length === 0) {
+      return { folder_id: null, folder_path: [], message: 'Root folder - no ID needed' };
+    }
+
+    try {
+      // Find folder by path - try both formats
+      const folderName = pathArr[pathArr.length - 1];
+      const { data: folder, error } = await db
+        .from('documents')
+        .select('id, title, folder_path')
+        .eq('org_id', orgId)
+        .eq('type', 'folder')
+        .or(`title.eq.[Folder] ${folderName},title.eq.${folderName}`);
+
+      if (error) throw error;
+      
+      console.log('📁 Found folders:', folder);
+
+      // For root folders (single level)
+      if (pathArr.length === 1) {
+        const rootFolder = folder?.find(f => 
+          !f.folder_path || 
+          (Array.isArray(f.folder_path) && f.folder_path.length === 0)
+        );
+        if (rootFolder) {
+          return { 
+            folder_id: rootFolder.id, 
+            folder_path: pathArr,
+            folder_title: rootFolder.title
+          };
+        }
+      } else {
+        // For nested folders, match by parent path
+        const parentPath = pathArr.slice(0, -1);
+        const nestedFolder = folder?.find(f => {
+          const folderPath = f.folder_path || [];
+          return Array.isArray(folderPath) && 
+                 folderPath.length === parentPath.length &&
+                 folderPath.every((seg, i) => seg === parentPath[i]);
+        });
+        
+        if (nestedFolder) {
+          return { 
+            folder_id: nestedFolder.id, 
+            folder_path: pathArr,
+            folder_title: nestedFolder.title
+          };
+        }
+      }
+
+      return { 
+        folder_id: null, 
+        folder_path: pathArr,
+        message: 'Folder not found'
+      };
+    } catch (error) {
+      console.error('Error resolving folder ID:', error);
+      throw error;
+    }
+  });
+
   app.get('/orgs/:orgId/folders', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);

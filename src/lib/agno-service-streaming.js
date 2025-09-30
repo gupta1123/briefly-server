@@ -36,6 +36,7 @@ export async function* callAgnoChatStream({
   context,
   filters,
   strictCitations,
+  webSearchEnabled,
 }) {
   if (!orgId) throw new Error('orgId is required to call Agno service');
   if (!question) throw new Error('question is required to call Agno service');
@@ -50,6 +51,7 @@ export async function* callAgnoChatStream({
     context,
     filters,
     strictCitations,
+    webSearchEnabled,
     user_id: userId,
     session_id: sessionId,
     stream: true, // Enable streaming

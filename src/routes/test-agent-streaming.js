@@ -233,9 +233,10 @@ export function registerStreamingTestAgentRoutes(app) {
         dateRange: z.object({ start: z.string().optional(), end: z.string().optional() }).optional(),
       }).optional(),
       strictCitations: z.boolean().optional(),
+      webSearchEnabled: z.boolean().optional().default(false),
     });
 
-    const { question, conversation = [], memory: userMemory = {}, context = { scope: 'org' }, filters = {}, strictCitations } = Schema.parse(req.body || {});
+    const { question, conversation = [], memory: userMemory = {}, context = { scope: 'org' }, filters = {}, strictCitations, webSearchEnabled } = Schema.parse(req.body || {});
 
     try {
       const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
@@ -381,6 +382,7 @@ export function registerStreamingTestAgentRoutes(app) {
         context,
         filters,
         strictCitations,
+        webSearchEnabled,
       });
 
       // Set up Server-Sent Events headers
