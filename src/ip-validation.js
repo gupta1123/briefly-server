@@ -4,6 +4,11 @@
  */
 
 import fp from 'fastify-plugin';
+import { getEffectivePermissions } from './routes.js';
+
+// Simple in-memory cache for IP settings
+const ipSettingsCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Get client IP address from request
@@ -41,12 +46,86 @@ function getClientIp(request) {
 }
 
 /**
- * Check if IP is in CIDR range (basic implementation)
- * For now, we'll do exact matching, but this can be extended
+ * Convert IP address to number for range calculations
+ */
+function ipToNumber(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) {
+    throw new Error(`Invalid IPv4 address: ${ip}`);
+  }
+  return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+/**
+ * Check if IP is in CIDR range
+ * Supports both exact matches and CIDR notation (e.g., 192.168.1.0/24)
  */
 function isIpInRange(ip, allowedIp) {
-  // For now, exact match. TODO: Add CIDR support
-  return ip === allowedIp;
+  try {
+    // Exact match
+    if (ip === allowedIp) {
+      return true;
+    }
+    
+    // CIDR notation (e.g., 192.168.1.0/24)
+    if (allowedIp.includes('/')) {
+      const [network, prefixLength] = allowedIp.split('/');
+      const prefix = parseInt(prefixLength, 10);
+      
+      if (isNaN(prefix) || prefix < 0 || prefix > 32) {
+        app.log.warn(`Invalid CIDR prefix length: ${prefixLength}`);
+        return false;
+      }
+      
+      try {
+        const ipNum = ipToNumber(ip);
+        const networkNum = ipToNumber(network);
+        const mask = (0xffffffff << (32 - prefix)) >>> 0;
+        
+        return (ipNum & mask) === (networkNum & mask);
+      } catch (error) {
+        app.log.warn(`Error processing CIDR ${allowedIp}: ${error.message}`);
+        return false;
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    app.log.warn(`Error checking IP range ${ip} against ${allowedIp}: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Get cached IP settings or fetch from database
+ */
+async function getIpSettings(app, orgId) {
+  const cacheKey = `ip_settings:${orgId}`;
+  const cached = ipSettingsCache.get(cacheKey);
+  
+  // Check if cache is still valid
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+  
+  // Fetch from database
+  const { data: orgSettings, error } = await app.supabaseAdmin
+    .from('org_settings')
+    .select('ip_allowlist_enabled, ip_allowlist_ips')
+    .eq('org_id', orgId)
+    .maybeSingle();
+  
+  if (error) {
+    throw error;
+  }
+  
+  // Cache the result
+  ipSettingsCache.set(cacheKey, {
+    data: orgSettings,
+    timestamp: Date.now()
+  });
+  
+  return orgSettings;
 }
 
 /**
@@ -54,26 +133,35 @@ function isIpInRange(ip, allowedIp) {
  */
 async function validateIpAccess(app, orgId, clientIp, userRole = null, hasBypass = false) {
   try {
-    // Fetch organization IP settings
-    const { data: orgSettings, error } = await app.supabaseAdmin
-      .from('org_settings')
-      .select('ip_allowlist_enabled, ip_allowlist_ips')
-      .eq('org_id', orgId)
-      .maybeSingle();
-
-    if (error) {
-      app.log.error(error, 'Failed to fetch org IP settings');
-      // On error, allow access but log the issue
-      return { allowed: true, reason: 'settings_fetch_error' };
-    }
+    // Get organization IP settings (with caching)
+    const orgSettings = await getIpSettings(app, orgId);
 
     // If no settings found or IP allowlist is disabled, allow access
     if (!orgSettings || !orgSettings.ip_allowlist_enabled) {
       return { allowed: true, reason: 'allowlist_disabled' };
     }
 
-    // Bypass: users with security.ip_bypass (or legacy admin role)
-    if (hasBypass || userRole === 'orgAdmin') {
+    // Bypass: users with security.ip_bypass permission
+    if (hasBypass) {
+      app.log.info({
+        orgId,
+        userId: 'unknown', // We don't have userId in this context
+        clientIp,
+        userRole,
+        reason: 'permission_bypass'
+      }, 'IP bypass granted via security.ip_bypass permission');
+      return { allowed: true, reason: 'permission_bypass' };
+    }
+    
+    // Legacy admin bypass (with enhanced logging)
+    if (userRole === 'orgAdmin') {
+      app.log.warn({
+        orgId,
+        userId: 'unknown', // We don't have userId in this context
+        clientIp,
+        userRole,
+        reason: 'admin_bypass'
+      }, 'Admin IP bypass used - consider using security.ip_bypass permission instead');
       return { allowed: true, reason: 'admin_bypass' };
     }
 
@@ -102,6 +190,13 @@ async function ipValidationPluginImpl(app, options) {
   // Add IP validation method to app instance
   app.decorate('validateIpAccess', validateIpAccess.bind(null, app));
   app.decorate('getClientIp', getClientIp);
+  
+  // Add cache invalidation method
+  app.decorate('invalidateIpSettingsCache', (orgId) => {
+    const cacheKey = `ip_settings:${orgId}`;
+    ipSettingsCache.delete(cacheKey);
+    app.log.info({ orgId }, 'IP settings cache invalidated');
+  });
 
   // IP validation middleware - can be used as preHandler
   app.decorate('requireIpAccess', async (request, reply) => {
@@ -120,8 +215,8 @@ async function ipValidationPluginImpl(app, options) {
       // Get client IP
       const clientIp = getClientIp(request);
       
-      // Get user's role, then fetch role permissions
-      const { data: membership } = await request.supabase
+      // Get user's role to aid in diagnostics
+      const { data: membership } = await app.supabaseAdmin
         .from('organization_users')
         .select('role, expires_at')
         .eq('org_id', orgId)
@@ -130,29 +225,38 @@ async function ipValidationPluginImpl(app, options) {
 
       const userRole = membership?.role;
       let hasBypass = false;
-      if (userRole) {
-        const { data: roleRow } = await request.supabase
-          .from('org_roles')
-          .select('permissions')
-          .eq('org_id', orgId)
-          .eq('key', userRole)
-          .maybeSingle();
-        const perms = roleRow?.permissions || {};
-        hasBypass = !!perms['security.ip_bypass'];
+      let bypassMeta = null;
+      try {
+        const permResult = await getEffectivePermissions(request, String(orgId), app);
+        const permissions = permResult.permissions || {};
+        request.permissions = permissions;
+        request.permissionsMeta = permResult.meta;
+        hasBypass = permissions['security.ip_bypass'] === true;
+        bypassMeta = permResult.meta?.security?.ip_bypass || null;
+      } catch (permError) {
+        app.log.warn(permError, 'Failed to compute effective permissions during IP validation');
       }
 
       // Validate IP access
       const validation = await validateIpAccess(app, orgId, clientIp, userRole, hasBypass);
+      request.ipBypassMeta = bypassMeta;
 
-      // Log the validation attempt
+      // Enhanced logging with more context
       app.log.info({
         userId: request.user.sub,
         orgId,
         clientIp,
+        userAgent: request.headers['user-agent'],
+        endpoint: request.url,
+        method: request.method,
         allowed: validation.allowed,
         reason: validation.reason,
         userRole,
-        hasBypass
+        hasBypass,
+        bypassSource: bypassMeta?.source || null,
+        bypassExpiresAt: bypassMeta?.expiresAt || null,
+        bypassGrantId: bypassMeta?.grantId || null,
+        timestamp: new Date().toISOString()
       }, 'IP validation check');
 
       // Block if not allowed

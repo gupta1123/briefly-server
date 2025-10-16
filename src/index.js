@@ -321,7 +321,7 @@ async function main() {
     const { orgId } = req.params;
     const diagnostics = [];
 
-    const expectedRoles = ['orgAdmin','contentManager','teamLead','member','contentViewer','guest'];
+    const expectedRoles = ['orgAdmin','contentManager','teamLead','member','contentViewer'];
     const { data: roles, error: rolesErr } = await admin.from('org_roles').select('key, permissions').eq('org_id', orgId);
     if (rolesErr) throw rolesErr;
     const roleKeys = new Set((roles || []).map(r => r.key));
@@ -416,12 +416,6 @@ async function main() {
         'documents.read': true, 'documents.create': false, 'documents.update': false, 'documents.delete': false,
         'documents.move': false, 'documents.link': false, 'documents.version.manage': false, 'documents.bulk_delete': false,
         'storage.upload': false, 'search.semantic': true, 'chat.save_sessions': false, 'audit.read': true,
-      } },
-      { key: 'guest', name: 'Guest', is_system: true, permissions: {
-        'org.manage_members': false, 'org.update_settings': false, 'security.ip_bypass': false,
-        'documents.read': true, 'documents.create': false, 'documents.update': false, 'documents.delete': false,
-        'documents.move': false, 'documents.link': false, 'documents.version.manage': false, 'documents.bulk_delete': false,
-        'storage.upload': false, 'search.semantic': false, 'chat.save_sessions': false, 'audit.read': false,
       } },
     ];
     const rows = defaults.map((r) => ({ org_id: orgId, key: r.key, name: r.name, is_system: r.is_system, permissions: r.permissions }));

@@ -214,9 +214,29 @@ async function getMyPermissions(req, orgId) {
   return roleRow?.permissions || {};
 }
 
+async function fetchActiveIpBypassGrant(adminClient, orgId, userId) {
+  if (!userId) return null;
+  const nowIso = new Date().toISOString();
+  const { data, error } = await adminClient
+    .from('ip_bypass_grants')
+    .select('id, expires_at, granted_at, granted_by, note')
+    .eq('org_id', orgId)
+    .eq('user_id', userId)
+    .is('revoked_at', null)
+    .gt('expires_at', nowIso)
+    .order('expires_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  if (!data || data.length === 0) return null;
+  const grant = data[0];
+  if (!grant?.expires_at) return null;
+  if (new Date(grant.expires_at).getTime() <= Date.now()) return null;
+  return grant;
+}
+
 // Merge role permissions with per-user overrides (org-wide and optional dept-specific)
-async function getEffectivePermissions(req, orgId, opts = {}) {
-  const db = req.supabase;
+async function getEffectivePermissions(req, orgId, app, opts = {}) {
+  const db = app.supabaseAdmin; // Use admin client to bypass RLS for override queries
   const userId = req.user?.sub;
   const deptId = Object.prototype.hasOwnProperty.call(opts, 'departmentId') ? opts.departmentId : undefined;
 
@@ -278,13 +298,40 @@ async function getEffectivePermissions(req, orgId, opts = {}) {
         ? !!orgOverride[k]
         : !!rolePerms[k];
   }
-  return effective;
+
+  const meta = {
+    security: {
+      ip_bypass: {
+        source: effective['security.ip_bypass'] === true ? 'roleOrOverride' : 'none',
+        expiresAt: null,
+        grantId: null,
+      },
+    },
+  };
+
+  try {
+    const grant = await fetchActiveIpBypassGrant(db, orgId, userId);
+    if (grant) {
+      effective['security.ip_bypass'] = true;
+      meta.security.ip_bypass = {
+        source: 'timedGrant',
+        expiresAt: grant.expires_at,
+        grantId: grant.id,
+      };
+    }
+  } catch (grantErr) {
+    try {
+      app.log?.warn(grantErr, 'Failed to fetch IP bypass grant');
+    } catch {}
+  }
+
+  return { permissions: effective, meta };
 }
 
-async function ensurePerm(req, permKey, opts = {}) {
+async function ensurePerm(req, permKey, app, opts = {}) {
   const orgId = requireOrg(req);
-  const perms = await getEffectivePermissions(req, orgId, opts);
-  if (!perms || perms[permKey] !== true) {
+  const { permissions } = await getEffectivePermissions(req, orgId, app, opts);
+  if (!permissions || permissions[permKey] !== true) {
     const err = new Error('Forbidden');
     err.statusCode = 403;
     throw err;
@@ -430,14 +477,34 @@ export function registerRoutes(app) {
       }
     }
 
-    // 6) my permissions for selected org
+    // 6) my permissions for selected org - get departments first to determine context
+    const { data: myDU } = await db
+      .from('department_users')
+      .select('department_id, role')
+      .eq('org_id', selectedOrgId)
+      .eq('user_id', userId);
+    
+    // Use first department for permission context, or null if no departments
+    const primaryDeptId = (myDU && myDU.length > 0) ? myDU[0].department_id : null;
+    
+    // Get effective permissions (role + overrides) with department context
     let permissions = {};
+    let permissionsMeta = {};
     try {
-      const { data: permMap, error } = await db.rpc('get_my_permissions', { p_org_id: selectedOrgId });
-      if (!error && permMap) permissions = permMap;
-      else permissions = await getMyPermissions(req, selectedOrgId);
-    } catch {
-      permissions = await getMyPermissions(req, selectedOrgId);
+      const permResult = await getEffectivePermissions(req, selectedOrgId, app, { departmentId: primaryDeptId });
+      permissions = permResult.permissions;
+      permissionsMeta = permResult.meta;
+    } catch (error) {
+      console.error('Failed to get effective permissions, falling back to role permissions:', error);
+      // Fallback to role permissions only
+      try {
+        const { data: permMap, error } = await db.rpc('get_my_permissions', { p_org_id: selectedOrgId });
+        if (!error && permMap) permissions = permMap;
+        else permissions = await getMyPermissions(req, selectedOrgId);
+      } catch {
+        permissions = await getMyPermissions(req, selectedOrgId);
+      }
+      permissionsMeta = {};
     }
 
     // 7) departments with membership flags and categories
@@ -447,11 +514,6 @@ export function registerRoutes(app) {
       .eq('org_id', selectedOrgId)
       .order('name');
     if (dErr) throw dErr;
-    const { data: myDU } = await db
-      .from('department_users')
-      .select('department_id, role')
-      .eq('org_id', selectedOrgId)
-      .eq('user_id', userId);
     const memSet = new Set((myDU || []).map((r) => r.department_id));
     const leadSet = new Set((myDU || []).filter((r) => r.role === 'lead').map((r) => r.department_id));
     const departments = (depts || []).map((d) => ({ 
@@ -468,6 +530,7 @@ export function registerRoutes(app) {
       orgSettings,
       userSettings,
       permissions,
+      permissionsMeta,
       departments,
     };
     console.log('Bootstrap endpoint returning data:', {
@@ -476,7 +539,9 @@ export function registerRoutes(app) {
       orgCount: orgs.length,
       departmentCount: departments.length,
       hasUserSettings: !!userSettings,
-      hasOrgSettings: !!orgSettings
+      hasOrgSettings: !!orgSettings,
+      permissions: permissions,
+      primaryDeptId
     });
     return result;
   });
@@ -523,7 +588,6 @@ export function registerRoutes(app) {
           'documents.bulk_delete': true,
           'storage.upload': true,
           'search.semantic': true,
-          'chat.save_sessions': true,
           'audit.read': true,
         } },
         { key: 'contentManager', name: 'Content Manager', is_system: true, permissions: {
@@ -540,7 +604,6 @@ export function registerRoutes(app) {
           'documents.bulk_delete': true,
           'storage.upload': true,
           'search.semantic': true,
-          'chat.save_sessions': true,
           'audit.read': true,
         } },
         { key: 'member', name: 'Member', is_system: true, permissions: {
@@ -557,7 +620,6 @@ export function registerRoutes(app) {
           'documents.bulk_delete': false,
           'storage.upload': true,
           'search.semantic': true,
-          'chat.save_sessions': false,
           'audit.read': false,
         } },
         { key: 'teamLead', name: 'Team Lead', is_system: true, permissions: {
@@ -574,7 +636,6 @@ export function registerRoutes(app) {
           'documents.bulk_delete': false,
           'storage.upload': true,
           'search.semantic': true,
-          'chat.save_sessions': false,
           'audit.read': true,
           'departments.read': true,
           'departments.manage_members': true,
@@ -593,25 +654,7 @@ export function registerRoutes(app) {
           'documents.bulk_delete': false,
           'storage.upload': false,
           'search.semantic': true,
-          'chat.save_sessions': false,
           'audit.read': true,
-        } },
-        { key: 'guest', name: 'Guest', is_system: true, permissions: {
-          'org.manage_members': false,
-          'org.update_settings': false,
-          'security.ip_bypass': false,
-          'documents.read': true,
-          'documents.create': false,
-          'documents.update': false,
-          'documents.delete': false,
-          'documents.move': false,
-          'documents.link': false,
-          'documents.version.manage': false,
-          'documents.bulk_delete': false,
-          'storage.upload': false,
-          'search.semantic': false,
-          'chat.save_sessions': false,
-          'audit.read': false,
         } },
       ];
       for (const r of defaults) {
@@ -642,7 +685,7 @@ export function registerRoutes(app) {
     // Allow org admins (org.manage_members) OR department leads to view user directory
     let canView = false;
     try {
-      await ensurePerm(req, 'org.manage_members');
+      await ensurePerm(req, 'org.manage_members', app);
       canView = true;
     } catch {
       // Not an org manager; check if caller is lead of any department in this org
@@ -680,7 +723,7 @@ export function registerRoutes(app) {
     // Fetch department memberships and department names/colors
     const { data: mems } = await db
       .from('department_users')
-      .select('user_id, department_id')
+      .select('user_id, department_id, role')
       .eq('org_id', orgId);
     const { data: depts } = await db
       .from('departments')
@@ -691,7 +734,12 @@ export function registerRoutes(app) {
     for (const m of mems || []) {
       const arr = userToDepts.get(m.user_id) || [];
       const d = deptMap.get(m.department_id);
-      if (d) arr.push({ id: d.id, name: d.name, color: d.color || null });
+      if (d) arr.push({ 
+        id: d.id, 
+        name: d.name, 
+        color: d.color || null,
+        deptRole: m.role 
+      });
       userToDepts.set(m.user_id, arr);
     }
 
@@ -745,7 +793,7 @@ export function registerRoutes(app) {
     }));
   });
 
-  app.patch('/orgs/:orgId/users/:userId', { preHandler: app.verifyAuth }, async (req) => {
+  app.patch('/orgs/:orgId/users/:userId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const { orgId: paramOrgId, userId } = req.params;
 
@@ -761,7 +809,6 @@ export function registerRoutes(app) {
 
     const Schema = z.object({
       role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/).optional(),
-      expires_at: z.string().datetime().optional(),
       password: z.string().min(6).optional(),
       display_name: z.string().optional()
     });
@@ -775,9 +822,9 @@ export function registerRoutes(app) {
     const isAdmin = callerOrgRole === 'orgAdmin';
     const isTeamLead = callerOrgRole === 'teamLead';
 
-    // First check if user exists in the organization
+    // First check if user exists in the organization (use admin client to bypass RLS)
     console.log('Checking if user exists in organization:', { orgId, userId });
-    const { data: existingUser, error: checkError } = await db
+    const { data: existingUser, error: checkError } = await app.supabaseAdmin
       .from('organization_users')
       .select('user_id, role, expires_at')
       .eq('org_id', orgId)
@@ -914,6 +961,7 @@ export function registerRoutes(app) {
     // At this point, existingUser is either the original or the newly created org user
     const userToCheck = existingUser;
     console.log('User found/created, proceeding with permission check:', userToCheck);
+    console.log('Body data to process:', { role: body.role, display_name: body.display_name });
 
     let canManageUser = false;
 
@@ -921,46 +969,114 @@ export function registerRoutes(app) {
       // Admins can manage all users
       console.log('User is admin, granting full access');
       canManageUser = true;
-    } else if (isTeamLead) {
-      // Team leads can only manage users in their departments
-      console.log('User is team lead, checking department membership...');
-
-      // Check if target user is in caller's department
-      const { data: sharedDepartment } = await db
-        .from('department_users')
-        .select('department_id')
-        .eq('org_id', orgId)
-        .eq('user_id', callerId)
-        .eq('role', 'lead');
-
-      if (sharedDepartment && sharedDepartment.length > 0) {
-        // Check if target user is in any of the caller's departments
-        const callerDeptIds = sharedDepartment.map(d => d.department_id);
-        const { data: targetUserDept } = await db
+    } else {
+      // Check if user has departments.manage_members permission first
+      let canManageTeamMembers = false;
+      try {
+        console.log('🔍 Checking departments.manage_members permission for user editing:', callerId);
+        // Get user's department context for permission checking
+        const { data: userDepts } = await db
           .from('department_users')
           .select('department_id')
           .eq('org_id', orgId)
-          .eq('user_id', userId)
-          .in('department_id', callerDeptIds)
-          .maybeSingle();
-
-            if (targetUserDept) {
-      // Additional checks for team leads
-      if (userId === callerId) {
-        console.log('Team lead cannot edit themselves');
-        canManageUser = false;
-      } else if (userToCheck.role === 'orgAdmin') {
-        console.log('Team lead cannot edit org admins');
-        canManageUser = false;
-      } else {
-        console.log('Target user is in caller\'s department, allowing edit');
-        canManageUser = true;
+          .eq('user_id', callerId);
+        
+        const userDeptIds = userDepts?.map(d => d.department_id) || [];
+        const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+        
+        console.log('🔍 User department context for user editing:', { userDeptIds, deptContext });
+        
+        await ensurePerm(req, 'departments.manage_members', app, { departmentId: deptContext });
+        canManageTeamMembers = true;
+        console.log('✅ User has departments.manage_members permission for user editing');
+      } catch (error) {
+        canManageTeamMembers = false;
+        console.log('❌ User does not have departments.manage_members permission for user editing:', error.message);
       }
-    } else {
-      console.log('Target user is not in caller\'s department');
-    }
+      
+      // If not, check if they're a team lead
+      if (!canManageTeamMembers && isTeamLead) {
+        console.log('User is team lead, checking department membership...');
+
+        // Check if target user is in caller's department
+        const { data: sharedDepartment } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', callerId)
+          .eq('role', 'lead');
+
+        if (sharedDepartment && sharedDepartment.length > 0) {
+          // Check if target user is in any of the caller's departments
+          const callerDeptIds = sharedDepartment.map(d => d.department_id);
+          const { data: targetUserDept } = await db
+            .from('department_users')
+            .select('department_id')
+            .eq('org_id', orgId)
+            .eq('user_id', userId)
+            .in('department_id', callerDeptIds)
+            .maybeSingle();
+
+              if (targetUserDept) {
+        // Additional checks for team leads
+        if (userToCheck.role === 'orgAdmin') {
+          console.log('Team lead cannot edit org admins');
+          canManageUser = false;
+        } else {
+          console.log('Target user is in caller\'s department, allowing edit');
+          canManageUser = true;
+        }
       } else {
-        console.log('Caller is not a department lead');
+        console.log('Target user is not in caller\'s department');
+      }
+        } else {
+          console.log('Caller is not a department lead');
+        }
+      }
+      
+      // If user has departments.manage_members permission, they can edit users in their departments
+      if (canManageTeamMembers) {
+        // Check if target user is in caller's departments (use admin client to bypass RLS)
+        const { data: callerDepts } = await app.supabaseAdmin
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', callerId);
+        
+        console.log('Caller departments for user editing:', callerDepts);
+        
+        if (callerDepts && callerDepts.length > 0) {
+          const callerDeptIds = callerDepts.map(d => d.department_id);
+          const { data: targetUserDept } = await app.supabaseAdmin
+            .from('department_users')
+            .select('department_id')
+            .eq('org_id', orgId)
+            .eq('user_id', userId)
+            .in('department_id', callerDeptIds)
+            .maybeSingle();
+
+          console.log('Target user department check for editing:', { userId, callerDeptIds, targetUserDept });
+
+          if (targetUserDept) {
+            // Additional checks for users with manage_members permission
+            if (userToCheck.role === 'orgAdmin') {
+              console.log('User with manage_members permission cannot edit org admins');
+              canManageUser = false;
+            } else {
+              console.log('Target user is in caller\'s department, allowing edit');
+              canManageUser = true;
+            }
+          } else {
+            console.log('Target user is not in caller\'s departments');
+            
+            // Fallback: Allow users with manage_members permission to edit display names only
+            // This is a common use case where team members need to update names
+            if (body.display_name !== undefined && body.role === undefined && body.password === undefined) {
+              console.log('Allowing display name edit for user with manage_members permission');
+              canManageUser = true;
+            }
+          }
+        }
       }
     }
 
@@ -972,6 +1088,11 @@ export function registerRoutes(app) {
     }
 
     console.log('Permission check passed');
+    console.log('About to process updates:', { 
+      hasPassword: !!body.password,
+      hasRole: body.role !== undefined,
+      hasDisplayName: body.display_name !== undefined
+    });
 
     // Handle password update if provided
     if (body.password) {
@@ -1033,48 +1154,66 @@ export function registerRoutes(app) {
       }
     }
 
-    // Only update if role, expires_at, or display_name are provided
-    if (body.role !== undefined || body.expires_at !== undefined || body.display_name !== undefined) {
-      const updateData = {};
+    // Only update if role or display_name are provided
+    let orgUserData = null;
+    let updateData = {};
+    
+    if (body.role !== undefined || body.display_name !== undefined) {
+      // Handle display_name update separately in app_users table
+      if (body.display_name !== undefined) {
+        console.log('Updating display_name in app_users table:', body.display_name);
+        const { data: displayNameResult, error: displayNameError } = await app.supabaseAdmin
+          .from('app_users')
+          .upsert({ 
+            id: userId, 
+            display_name: body.display_name 
+          })
+          .select('*');
+        
+        if (displayNameError) {
+          console.error('Error updating display_name:', displayNameError);
+          throw new Error('Failed to update display name: ' + displayNameError.message);
+        }
+        console.log('✅ Display name updated successfully:', displayNameResult);
+      }
+
+      // Handle role and expires_at updates in organization_users table
       if (body.role !== undefined) updateData.role = body.role;
-      if (body.expires_at !== undefined) updateData.expires_at = body.expires_at;
-      if (body.display_name !== undefined) updateData.display_name = body.display_name;
 
-      console.log('Updating user data in database:', updateData);
+      if (Object.keys(updateData).length > 0) {
+        console.log('Updating organization_users data:', updateData);
 
-      // Update organization_users table
-      const { data: orgUserData, error: orgError } = await db
+        // Update organization_users table (use admin client to bypass RLS)
+        const { data: updatedData, error: orgError } = await app.supabaseAdmin
+          .from('organization_users')
+          .update(updateData)
+          .eq('org_id', orgId)
+          .eq('user_id', userId)
+          .select('*')
+          .single();
+
+        if (orgError) {
+          console.error('Error updating user in organization_users:', orgError);
+          throw new Error('Failed to update user: ' + orgError.message);
+        }
+        orgUserData = updatedData;
+      }
+    }
+
+    console.log('Database update successful, returning data');
+    
+    // Return the updated user data
+    if (orgUserData) {
+      return orgUserData;
+    } else {
+      // If only display_name was updated, fetch the current user data
+      const { data: currentUser } = await db
         .from('organization_users')
-        .update(updateData)
+        .select('*')
         .eq('org_id', orgId)
         .eq('user_id', userId)
-        .select('*')
         .single();
-
-      if (orgError) {
-        console.error('Error updating user in organization_users:', orgError);
-        throw new Error('Failed to update user: ' + orgError.message);
-      }
-
-      // If display_name was updated, also update app_users table
-      if (body.display_name !== undefined) {
-        console.log('Updating display_name in app_users table');
-        const { error: appError } = await db
-          .from('app_users')
-          .update({ display_name: body.display_name })
-          .eq('id', userId);
-
-        if (appError) {
-          console.error('Error updating display_name in app_users:', appError);
-          // Don't throw here as the org_users update succeeded
-          // Just log the error for monitoring
-        } else {
-          console.log('Successfully updated display_name in app_users');
-        }
-      }
-
-      console.log('Database update successful, returning data');
-      return orgUserData;
+      return currentUser;
     }
 
     // If only password was updated, return the user data
@@ -1082,30 +1221,56 @@ export function registerRoutes(app) {
     return userToCheck;
   });
 
-  // Invite/create a user and add to org with optional expiry
-  app.post('/orgs/:orgId/users', { preHandler: app.verifyAuth }, async (req) => {
+  // Invite/create a user and add to org
+  app.post('/orgs/:orgId/users', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Allow org admins or department leads to create users.
-    // Admins: unrestricted (existing behavior). Dept leads: restricted to creating member/guest only.
+    // Admins: unrestricted (existing behavior). Dept leads: restricted to creating baseline roles.
     let isAdmin = false;
-    try { await ensurePerm(req, 'org.manage_members'); isAdmin = true; } catch { isAdmin = false; }
-    const Schema = z.object({ email: z.string().email(), display_name: z.string().optional(), role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/), expires_at: z.string().datetime().optional(), password: z.string().min(6).optional() });
+    try { await ensurePerm(req, 'org.manage_members', app); isAdmin = true; } catch { isAdmin = false; }
+    const Schema = z.object({ email: z.string().email(), display_name: z.string().optional(), role: z.string().min(2).regex(/^[A-Za-z0-9_-]+$/), password: z.string().min(6).optional() });
     const body = Schema.parse(req.body || {});
     if (!isAdmin) {
-      // Verify caller is a department lead in this org
-      const { data: leadAny } = await db
-        .from('department_users')
-        .select('department_id')
-        .eq('org_id', orgId)
-        .eq('user_id', req.user?.sub)
-        .eq('role', 'lead')
-        .limit(1);
-      if (!leadAny || leadAny.length === 0) {
-        const err = new Error('Forbidden'); err.statusCode = 403; throw err;
+      // Check if user has departments.manage_members permission first
+      let canManageTeamMembers = false;
+      try {
+        console.log('🔍 Checking departments.manage_members permission for user:', req.user?.sub);
+        // Get user's department context for permission checking
+        const { data: userDepts } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub);
+        
+        const userDeptIds = userDepts?.map(d => d.department_id) || [];
+        const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+        
+        console.log('🔍 User department context:', { userDeptIds, deptContext });
+        
+        await ensurePerm(req, 'departments.manage_members', app, { departmentId: deptContext });
+        canManageTeamMembers = true;
+        console.log('✅ User has departments.manage_members permission');
+      } catch (error) {
+        canManageTeamMembers = false;
+        console.log('❌ User does not have departments.manage_members permission:', error.message);
+      }
+      
+      // If not, verify caller is a department lead in this org
+      if (!canManageTeamMembers) {
+        const { data: leadAny } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .eq('role', 'lead')
+          .limit(1);
+        if (!leadAny || leadAny.length === 0) {
+          const err = new Error('Forbidden'); err.statusCode = 403; throw err;
+        }
       }
       // Restrict role assignment: leads cannot create admins or team leads
-      const allowed = new Set(['member','guest','contentViewer','contentManager']);
+      const allowed = new Set(['member','contentViewer','contentManager']);
       if (!allowed.has(body.role)) {
         const err = new Error('Only admins can assign elevated org roles'); err.statusCode = 403; throw err;
       }
@@ -1161,7 +1326,7 @@ export function registerRoutes(app) {
     // Insert org membership using service role to bypass RLS for team leads
     const { data, error } = await app.supabaseAdmin
       .from('organization_users')
-      .upsert({ org_id: orgId, user_id: authUserId, role: body.role, expires_at: body.expires_at || null }, { onConflict: 'org_id,user_id' })
+      .upsert({ org_id: orgId, user_id: authUserId, role: body.role, expires_at: null }, { onConflict: 'org_id,user_id' })
       .select('*')
       .single();
     if (error) throw error;
@@ -1172,12 +1337,79 @@ export function registerRoutes(app) {
   });
 
   // Remove a user from the organization (does not delete auth account)
-  app.delete('/orgs/:orgId/users/:userId', { preHandler: app.verifyAuth }, async (req) => {
+  app.delete('/orgs/:orgId/users/:userId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const { userId } = req.params;
-    // Require permission to manage members
-    await ensurePerm(req, 'org.manage_members');
+
+    // Check permissions: org admins OR department leads for users in their departments
+    const callerId = req.user?.sub;
+    const callerOrgRole = await getUserOrgRole(req);
+    const isAdmin = callerOrgRole === 'orgAdmin';
+    const isTeamLead = callerOrgRole === 'teamLead';
+
+    let canDelete = false;
+
+    if (isAdmin) {
+      // Admins can delete all users
+      canDelete = true;
+    } else if (isTeamLead) {
+      // Team leads can delete users in their departments (but not themselves or admins)
+      if (userId === callerId) {
+        const err = new Error('Cannot delete yourself');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      // Check if target user is an admin
+      const { data: targetUser } = await db
+        .from('organization_users')
+        .select('role')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .single();
+
+      if (targetUser?.role === 'orgAdmin') {
+        const err = new Error('Cannot delete organization administrators');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      // Check if target user is in caller's department
+      const { data: sharedDepartment } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', callerId)
+        .eq('role', 'lead');
+
+      if (sharedDepartment && sharedDepartment.length > 0) {
+        const callerDeptIds = sharedDepartment.map(d => d.department_id);
+        const { data: targetUserDept } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', userId)
+          .in('department_id', callerDeptIds)
+          .maybeSingle();
+
+        if (targetUserDept) {
+          canDelete = true;
+        }
+      }
+    }
+
+    if (!canDelete) {
+      const err = new Error('Forbidden');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    // Require permission to manage members (legacy check for admins)
+    if (isAdmin) {
+      await ensurePerm(req, 'org.manage_members', app);
+    }
+
     // Remove org membership
     const { error } = await db
       .from('organization_users')
@@ -1213,7 +1445,7 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/roles', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.manage_members');
+    await ensurePerm(req, 'org.manage_members', app);
     const { data, error } = await db
       .from('org_roles')
       .select('*')
@@ -1224,10 +1456,10 @@ export function registerRoutes(app) {
     return data;
   });
 
-  app.post('/orgs/:orgId/roles', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/roles', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.manage_members');
+    await ensurePerm(req, 'org.manage_members', app);
     const Schema = z.object({ key: z.string().min(2).regex(/^[a-zA-Z0-9_-]+$/), name: z.string().min(2), description: z.string().optional(), permissions: z.record(z.boolean()).default({}) });
     const body = Schema.parse(req.body || {});
     const { data, error } = await db
@@ -1239,10 +1471,10 @@ export function registerRoutes(app) {
     return data;
   });
 
-  app.patch('/orgs/:orgId/roles/:key', { preHandler: app.verifyAuth }, async (req) => {
+  app.patch('/orgs/:orgId/roles/:key', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.manage_members');
+    await ensurePerm(req, 'org.manage_members', app);
     const { key } = req.params;
     const Schema = z.object({ name: z.string().min(2).optional(), description: z.string().optional(), permissions: z.record(z.boolean()).optional() });
     const body = Schema.parse(req.body || {});
@@ -1266,13 +1498,38 @@ export function registerRoutes(app) {
       .select('*')
       .single();
     if (error) throw error;
+    
+    // If permissions were updated, invalidate caches for all users with this role
+    if (body.permissions) {
+      try {
+        // Get all users with this role in this organization
+        const { data: usersWithRole } = await db
+          .from('organization_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('role', key);
+        
+        // Invalidate permission cache for each user
+        if (usersWithRole && usersWithRole.length > 0) {
+          const { invalidateUserOrgCache } = await import('./cache.js');
+          for (const user of usersWithRole) {
+            invalidateUserOrgCache(user.user_id, orgId);
+          }
+          console.log(`🔄 Invalidated permission cache for ${usersWithRole.length} users with role ${key}`);
+        }
+      } catch (cacheError) {
+        console.warn('Failed to invalidate permission caches:', cacheError.message);
+        // Don't fail the role update if cache invalidation fails
+      }
+    }
+    
     return data;
   });
 
-  app.delete('/orgs/:orgId/roles/:key', { preHandler: app.verifyAuth }, async (req) => {
+  app.delete('/orgs/:orgId/roles/:key', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.manage_members');
+    await ensurePerm(req, 'org.manage_members', app);
     const { key } = req.params;
     const { data: role } = await db
       .from('org_roles')
@@ -1412,22 +1669,41 @@ export function registerRoutes(app) {
     return list;
   });
 
-  app.post('/orgs/:orgId/departments', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/departments', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = app.supabaseAdmin; // Use admin client to bypass RLS policies
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
     const Schema = z.object({ name: z.string().min(2), leadUserId: z.string().uuid().nullable().optional(), color: z.string().optional() });
     const body = Schema.parse(req.body || {});
     const payload = { org_id: orgId, name: body.name, lead_user_id: body.leadUserId ?? null, color: body.color };
     const { data, error } = await db.from('departments').insert(payload).select('*').single();
     if (error) throw error;
+    
+    // Automatically add the creator to the team as a member so they can see team members
+    const creatorId = req.user?.sub;
+    if (creatorId && !body.leadUserId) {
+      // Only add creator as member if they're not already set as the lead
+      try {
+        await db.from('department_users').insert({
+          org_id: orgId,
+          department_id: data.id,
+          user_id: creatorId,
+          role: 'member'
+        });
+        console.log(`✅ Added creator ${creatorId} to team ${data.id} as member`);
+      } catch (addError) {
+        console.warn('Failed to add creator to team:', addError.message);
+        // Don't fail the team creation if adding the creator fails
+      }
+    }
+    
     return data;
   });
 
-  app.patch('/orgs/:orgId/departments/:deptId', { preHandler: app.verifyAuth }, async (req) => {
+  app.patch('/orgs/:orgId/departments/:deptId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = app.supabaseAdmin; // Use admin client to bypass RLS policies
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
     const { deptId } = req.params;
     const Schema = z.object({ name: z.string().min(2).optional(), leadUserId: z.string().uuid().nullable().optional(), color: z.string().optional() });
     const body = Schema.parse(req.body || {});
@@ -1446,10 +1722,10 @@ export function registerRoutes(app) {
     return data;
   });
 
-  app.delete('/orgs/:orgId/departments/:deptId', { preHandler: app.verifyAuth }, async (req) => {
+  app.delete('/orgs/:orgId/departments/:deptId', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = app.supabaseAdmin; // Use admin client to bypass RLS policies
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
     const { deptId } = req.params;
     // Ensure department is empty (no docs, no users)
     const { count: docCount } = await db
@@ -1482,20 +1758,28 @@ export function registerRoutes(app) {
     const isOrgAdmin = role === 'orgAdmin';
     const isTeamLead = role === 'teamLead';
     
+    console.log('Team members endpoint debug:', {
+      userId: req.user?.sub,
+      role,
+      isOrgAdmin,
+      isTeamLead,
+      deptId: req.params.deptId,
+      orgId
+    });
+    
+    // Debug: Let's also check what the database actually returns
+    const { data: debugRoleData } = await db
+      .from('organization_users')
+      .select('role, expires_at')
+      .eq('org_id', orgId)
+      .eq('user_id', req.user?.sub)
+      .maybeSingle();
+    console.log('Direct database query result:', debugRoleData);
+    
     if (!isOrgAdmin) {
       const { deptId } = req.params;
       const userId = req.user?.sub;
       
-      // Check if user is a department lead for this specific department
-      const { data: lead } = await db
-        .from('department_users')
-        .select('user_id')
-        .eq('org_id', orgId)
-        .eq('department_id', deptId)
-        .eq('user_id', userId)
-        .eq('role', 'lead')
-        .maybeSingle();
-        
       // For teamLead org role: they can access any department they are a member of (lead or member)
       if (isTeamLead) {
         const { data: membership } = await db
@@ -1512,22 +1796,68 @@ export function registerRoutes(app) {
           throw e; 
         }
       } else {
-        // For non-teamLead roles, they must be a department lead
-        if (!lead) { 
-          const e = new Error('Forbidden'); 
-          e.statusCode = 403; 
-          throw e; 
+        // For non-orgAdmin, non-teamLead roles, check if they have departments.manage_members permission
+        try {
+          await ensurePerm(req, 'departments.manage_members', app, { departmentId: deptId });
+        } catch (permError) {
+          // If no manage_members permission, they must be a department lead
+          const { data: lead } = await db
+            .from('department_users')
+            .select('user_id')
+            .eq('org_id', orgId)
+            .eq('department_id', deptId)
+            .eq('user_id', userId)
+            .eq('role', 'lead')
+            .maybeSingle();
+            
+          if (!lead) { 
+            const e = new Error('Forbidden'); 
+            e.statusCode = 403; 
+            throw e; 
+          }
         }
       }
     }
     const { deptId } = req.params;
-    const { data, error } = await db
+    const { data, error } = await app.supabaseAdmin
       .from('department_users')
       .select('user_id, role, app_users(display_name)')
       .eq('org_id', orgId)
       .eq('department_id', deptId);
     if (error) throw error;
     const rows = data || [];
+    
+    console.log('Department users query result:', {
+      deptId,
+      orgId,
+      rowCount: rows.length,
+      rows: rows.map(r => ({ userId: r.user_id, role: r.role, displayName: r.app_users?.display_name }))
+    });
+    
+    // Debug: Check if there are any other users in this department
+    const { data: allDeptUsers } = await app.supabaseAdmin
+      .from('department_users')
+      .select('user_id, role')
+      .eq('org_id', orgId)
+      .eq('department_id', deptId);
+    console.log('All department users (admin query):', allDeptUsers);
+
+    // Get organization roles for all users
+    const userIds = rows.map(r => r.user_id);
+    // Use service role client to bypass RLS policies
+    const { data: orgUsers } = await app.supabaseAdmin
+      .from('organization_users')
+      .select('user_id, role')
+      .eq('org_id', orgId)
+      .in('user_id', userIds);
+
+    const userOrgRoles = new Map();
+    if (orgUsers) {
+      for (const ou of orgUsers) {
+        userOrgRoles.set(ou.user_id, ou.role);
+      }
+    }
+
     // Attach email and metadata display name via Admin API fallback
     const idToEmail = new Map();
     const idToMetaName = new Map();
@@ -1542,12 +1872,13 @@ export function registerRoutes(app) {
     return rows.map(r => ({
       userId: r.user_id,
       role: r.role,
+      orgRole: userOrgRoles.get(r.user_id) || 'member',
       displayName: r.app_users?.display_name || idToMetaName.get(r.user_id) || null,
       email: idToEmail.get(r.user_id) || null,
     }));
   });
 
-  app.post('/orgs/:orgId/departments/:deptId/users', { preHandler: app.verifyAuth }, async (req) => {
+  app.post('/orgs/:orgId/departments/:deptId/users', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = app.supabaseAdmin; // Use admin client to bypass RLS policies
     const orgId = await ensureActiveMember(req);
     const { deptId } = req.params;
@@ -1594,31 +1925,57 @@ export function registerRoutes(app) {
       }
     }
     
-    // Non-admins must be department lead of this dept
+    // Non-admins must be department lead of this dept OR have departments.manage_members permission
     if (!isAdmin) {
-      // Check if caller is a department lead for this specific department
-      const { data: lead } = await db
-        .from('department_users')
-        .select('user_id')
-        .eq('org_id', orgId)
-        .eq('department_id', deptId)
-        .eq('user_id', callerId)
-        .eq('role', 'lead')
-        .maybeSingle();
+      // Check if user has departments.manage_members permission first
+      let canManageTeamMembers = false;
+      try {
+        console.log('🔍 Checking departments.manage_members permission for adding user to department:', callerId);
+        // Get user's department context for permission checking
+        const { data: userDepts } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', callerId);
         
-      // Team leads can only manage departments where they are leads
-      if (isTeamLead) {
-        if (!lead) {
-          const e = new Error('Team leads can only manage departments where they are team leads'); 
-          e.statusCode = 403; 
-          throw e; 
-        }
-      } else {
-        // For non-teamLead roles, they must be a department lead
-        if (!lead) { 
-          const e = new Error('Forbidden'); 
-          e.statusCode = 403; 
-          throw e; 
+        const userDeptIds = userDepts?.map(d => d.department_id) || [];
+        const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+        
+        console.log('🔍 User department context for department user addition:', { userDeptIds, deptContext });
+        
+        await ensurePerm(req, 'departments.manage_members', app, { departmentId: deptContext });
+        canManageTeamMembers = true;
+        console.log('✅ User has departments.manage_members permission for department user addition');
+      } catch (error) {
+        canManageTeamMembers = false;
+        console.log('❌ User does not have departments.manage_members permission for department user addition:', error.message);
+      }
+      
+      // If not, check if caller is a department lead for this specific department
+      if (!canManageTeamMembers) {
+        const { data: lead } = await db
+          .from('department_users')
+          .select('user_id')
+          .eq('org_id', orgId)
+          .eq('department_id', deptId)
+          .eq('user_id', callerId)
+          .eq('role', 'lead')
+          .maybeSingle();
+          
+        // Team leads can only manage departments where they are leads
+        if (isTeamLead) {
+          if (!lead) {
+            const e = new Error('Team leads can only manage departments where they are team leads'); 
+            e.statusCode = 403; 
+            throw e; 
+          }
+        } else {
+          // For non-teamLead roles, they must be a department lead
+          if (!lead) { 
+            const e = new Error('Forbidden'); 
+            e.statusCode = 403; 
+            throw e; 
+          }
         }
       }
       
@@ -1680,38 +2037,65 @@ export function registerRoutes(app) {
     const isAdmin = callerOrgRole === 'orgAdmin';
     const isTeamLead = callerOrgRole === 'teamLead';
     
-    // Non-admins must be department lead of this dept
+    // Non-admins must be department lead of this dept OR have departments.manage_members permission
     if (!isAdmin) {
-      const { data: lead } = await db
-        .from('department_users')
-        .select('user_id')
-        .eq('org_id', orgId)
-        .eq('department_id', deptId)
-        .eq('user_id', callerId)
-        .eq('role', 'lead')
-        .maybeSingle();
+      // Check if user has departments.manage_members permission first
+      let canManageTeamMembers = false;
+      try {
+        console.log('🔍 Checking departments.manage_members permission for user deletion:', callerId);
+        // Get user's department context for permission checking
+        const { data: userDepts } = await db
+          .from('department_users')
+          .select('department_id')
+          .eq('org_id', orgId)
+          .eq('user_id', callerId);
         
-      // For teamLead org role: they can manage any department they are a member of
-      if (isTeamLead) {
-        const { data: membership } = await db
+        const userDeptIds = userDepts?.map(d => d.department_id) || [];
+        const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+        
+        console.log('🔍 User department context for user deletion:', { userDeptIds, deptContext });
+        
+        await ensurePerm(req, 'departments.manage_members', app, { departmentId: deptContext });
+        canManageTeamMembers = true;
+        console.log('✅ User has departments.manage_members permission for user deletion');
+      } catch (error) {
+        canManageTeamMembers = false;
+        console.log('❌ User does not have departments.manage_members permission for user deletion:', error.message);
+      }
+      
+      // If not, check if they're a department lead
+      if (!canManageTeamMembers) {
+        const { data: lead } = await db
           .from('department_users')
           .select('user_id')
           .eq('org_id', orgId)
           .eq('department_id', deptId)
           .eq('user_id', callerId)
+          .eq('role', 'lead')
           .maybeSingle();
           
-        if (!membership) {
-          const e = new Error('Team leads can only manage departments they are members of'); 
-          e.statusCode = 403; 
-          throw e; 
-        }
-      } else {
-        // For non-teamLead roles, they must be a department lead
-        if (!lead) { 
-          const e = new Error('Forbidden'); 
-          e.statusCode = 403; 
-          throw e; 
+        // For teamLead org role: they can manage any department they are a member of
+        if (isTeamLead) {
+          const { data: membership } = await db
+            .from('department_users')
+            .select('user_id')
+            .eq('org_id', orgId)
+            .eq('department_id', deptId)
+            .eq('user_id', callerId)
+            .maybeSingle();
+            
+          if (!membership) {
+            const e = new Error('Team leads can only manage departments they are members of'); 
+            e.statusCode = 403; 
+            throw e; 
+          }
+        } else {
+          // For non-teamLead roles, they must be a department lead
+          if (!lead) { 
+            const e = new Error('Forbidden'); 
+            e.statusCode = 403; 
+            throw e; 
+          }
         }
       }
       
@@ -1749,12 +2133,40 @@ export function registerRoutes(app) {
         .eq('id', deptId);
     }
 
+    // Check if user is in any other departments
+    const { count: otherDeptCount } = await db
+      .from('department_users')
+      .select('department_id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+
+    // If user is not in any other departments, remove them from the organization entirely
+    if ((otherDeptCount || 0) === 0) {
+      console.log(`User ${userId} is not in any other departments, removing from organization`);
+
+      // Remove from organization_users
+      const { error: orgRemoveError } = await db
+        .from('organization_users')
+        .delete()
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+
+      if (orgRemoveError) {
+        console.warn('Failed to remove user from organization:', orgRemoveError);
+        // Don't fail the request if org removal fails
+      } else {
+        console.log(`User ${userId} removed from organization ${orgId}`);
+      }
+    } else {
+      console.log(`User ${userId} still in ${otherDeptCount} other departments, keeping in organization`);
+    }
+
     return { ok: true };
   });
 
   // Per-user overrides (org-wide or department-specific)
   app.get('/orgs/:orgId/overrides', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
+    const db = app.supabaseAdmin; // Use admin client to bypass RLS since we've already done permission checks
     const orgId = await ensureActiveMember(req);
     const q = req.query || {};
     const userId = typeof q.userId === 'string' ? q.userId : undefined;
@@ -1765,6 +2177,60 @@ export function registerRoutes(app) {
       if (raw === 'null' || raw === '' || raw === null) deptParam = null;
       else if (typeof raw === 'string') deptParam = raw;
     }
+    
+    // Check if user has permission to read overrides
+    try {
+      await ensurePerm(req, 'org.manage_members', app);
+    } catch (permError) {
+      // If not org admin, check if they're a department lead for the specific department
+      if (typeof deptParam === 'string') {
+        const { data: deptMembership } = await db
+          .from('department_users')
+          .select('role')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .eq('department_id', deptParam)
+          .eq('role', 'lead')
+          .maybeSingle();
+        
+        if (!deptMembership) {
+          const err = new Error('Access denied: You must be an organization administrator or department lead to view user overrides');
+          err.statusCode = 403;
+          throw err;
+        }
+      } else {
+        // Org-wide overrides require org admin permission
+        const err = new Error('Access denied: Organization-wide overrides require administrator privileges');
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+    
+    // Check Core team access restriction
+    if (typeof deptParam === 'string') {
+      const { data: deptInfo } = await db
+        .from('departments')
+        .select('name')
+        .eq('id', deptParam)
+        .eq('org_id', orgId)
+        .single();
+      
+      if (deptInfo?.name === 'Core') {
+        // Check if the requesting user is an org admin
+        const { data: requesterRole } = await db
+          .from('organization_users')
+          .select('role')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .single();
+        
+        if (requesterRole?.role !== 'orgAdmin') {
+          const err = new Error('Access denied: Core team is restricted to organization administrators only');
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+    }
     let qb = db.from('user_access_overrides').select('*').eq('org_id', orgId);
     if (userId) qb = qb.eq('user_id', userId);
     if (deptParam === null) qb = qb.is('department_id', null);
@@ -1774,26 +2240,236 @@ export function registerRoutes(app) {
     return data || [];
   });
 
-  app.put('/orgs/:orgId/overrides', { preHandler: app.verifyAuth }, async (req) => {
+  app.put('/orgs/:orgId/overrides', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const Schema = z.object({ userId: z.string().uuid(), departmentId: z.string().uuid().nullable().optional(), permissions: z.record(z.boolean()) });
     const body = Schema.parse(req.body || {});
+    
+    // Check if user has permission to manage overrides
+    try {
+      await ensurePerm(req, 'org.manage_members', app);
+    } catch (permError) {
+      // If not org admin, check if they're a department lead for the specific department
+      if (body.departmentId) {
+        const { data: deptMembership } = await db
+          .from('department_users')
+          .select('role')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .eq('department_id', body.departmentId)
+          .eq('role', 'lead')
+          .maybeSingle();
+        
+        if (!deptMembership) {
+          const err = new Error('Access denied: You must be an organization administrator or department lead to manage user overrides');
+          err.statusCode = 403;
+          throw err;
+        }
+      } else {
+        // Org-wide overrides require org admin permission
+        const err = new Error('Access denied: Organization-wide overrides require administrator privileges');
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+    
+    // Check Core team access restriction
+    if (body.departmentId) {
+      const { data: deptInfo } = await db
+        .from('departments')
+        .select('name')
+        .eq('id', body.departmentId)
+        .eq('org_id', orgId)
+        .single();
+      
+      if (deptInfo?.name === 'Core') {
+        // Check if the requesting user is an org admin
+        const { data: requesterRole } = await db
+          .from('organization_users')
+          .select('role')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .single();
+        
+        if (requesterRole?.role !== 'orgAdmin') {
+          const err = new Error('Access denied: Core team is restricted to organization administrators only');
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+    }
+    
     const payload = { org_id: orgId, user_id: body.userId, department_id: (Object.prototype.hasOwnProperty.call(body,'departmentId') ? body.departmentId : null), permissions: body.permissions };
-    const { data, error } = await db
+    console.log('🔍 Debug: Creating override with payload:', payload);
+    
+    // Use supabaseAdmin to bypass RLS since we've already done permission checks above
+    const { data, error } = await app.supabaseAdmin
       .from('user_access_overrides')
       .upsert(payload, { onConflict: 'org_id,user_id,department_id' })
       .select('*')
       .single();
-    if (error) throw error;
+    
+    if (error) {
+      console.error('❌ Override creation error:', error);
+      throw error;
+    }
+    
+    console.log('🔍 Debug: Override created successfully:', data);
+    
+    // Verify the record was actually saved by querying it back
+    const { data: verifyData, error: verifyError } = await app.supabaseAdmin
+      .from('user_access_overrides')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('user_id', body.userId)
+      .eq('department_id', payload.department_id);
+    
+    console.log('🔍 Debug: Verification query result:', verifyData);
+    if (verifyError) {
+      console.error('❌ Verification query error:', verifyError);
+    }
+    
+    // Invalidate permission cache for the user whose override was created
+    const { invalidateUserOrgCache } = await import('./cache.js');
+    invalidateUserOrgCache(body.userId, orgId);
+    console.log(`🔄 Invalidated permission cache for user ${body.userId} after override update`);
+    
     return data;
+  });
+
+  app.get('/orgs/:orgId/ip-bypass-grants', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members', app);
+    const db = app.supabaseAdmin;
+    const q = req.query || {};
+    const nowIso = new Date().toISOString();
+    let qb = db
+      .from('ip_bypass_grants')
+      .select('*')
+      .eq('org_id', orgId)
+      .order('granted_at', { ascending: false });
+    if (typeof q.userId === 'string') qb = qb.eq('user_id', q.userId);
+    const activeParam = typeof q.active === 'string' ? q.active.toLowerCase() : q.active;
+    if (activeParam === 'true' || activeParam === true) {
+      qb = qb.is('revoked_at', null).gt('expires_at', nowIso);
+    }
+    const { data, error } = await qb;
+    if (error) throw error;
+    return data || [];
+  });
+
+  app.post('/orgs/:orgId/ip-bypass-grants', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const orgId = await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members', app);
+    const Schema = z.object({
+      userId: z.string().uuid(),
+      durationMinutes: z.number().int().positive().max(60 * 24 * 14).optional(),
+      expiresAt: z.string().datetime().optional(),
+      note: z.string().max(500).optional(),
+    }).refine((value) => !!value.durationMinutes || !!value.expiresAt, {
+      message: 'durationMinutes or expiresAt is required',
+      path: ['durationMinutes'],
+    });
+    const body = Schema.parse(req.body || {});
+    const now = Date.now();
+    let expiresAtMs = null;
+    if (typeof body.durationMinutes === 'number') {
+      expiresAtMs = now + body.durationMinutes * 60_000;
+    }
+    if (body.expiresAt) {
+      const parsed = new Date(body.expiresAt).getTime();
+      if (Number.isNaN(parsed)) {
+        const err = new Error('Invalid expiresAt value');
+        err.statusCode = 400;
+        throw err;
+      }
+      expiresAtMs = parsed;
+    }
+    if (!expiresAtMs || expiresAtMs <= now) {
+      const err = new Error('expiresAt must be in the future');
+      err.statusCode = 400;
+      throw err;
+    }
+    const expiresAtIso = new Date(expiresAtMs).toISOString();
+    const db = app.supabaseAdmin;
+    const nowIso = new Date().toISOString();
+    await db
+      .from('ip_bypass_grants')
+      .update({ revoked_at: nowIso })
+      .eq('org_id', orgId)
+      .eq('user_id', body.userId)
+      .is('revoked_at', null)
+      .gt('expires_at', nowIso);
+    const { data, error } = await db
+      .from('ip_bypass_grants')
+      .insert({
+        org_id: orgId,
+        user_id: body.userId,
+        granted_by: req.user?.sub || null,
+        expires_at: expiresAtIso,
+        note: body.note || null,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+    try {
+      await app.supabaseAdmin.from('audit_events').insert({
+        org_id: orgId,
+        actor_user_id: req.user?.sub || null,
+        type: 'ops.ip_bypass.grant',
+        note: `${body.userId} until ${expiresAtIso}`,
+      });
+    } catch (auditError) {
+      app.log.warn(auditError, 'Failed to audit IP bypass grant');
+    }
+    try {
+      const { invalidateUserOrgCache } = await import('./cache.js');
+      invalidateUserOrgCache(body.userId, orgId);
+    } catch {}
+    return data;
+  });
+
+  app.post('/orgs/:orgId/ip-bypass-grants/:grantId/revoke', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
+    const { orgId, grantId } = req.params;
+    await ensureActiveMember(req);
+    await ensurePerm(req, 'org.manage_members', app);
+    const nowIso = new Date().toISOString();
+    const { data, error } = await app.supabaseAdmin
+      .from('ip_bypass_grants')
+      .update({ revoked_at: nowIso })
+      .eq('org_id', orgId)
+      .eq('id', grantId)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      const err = new Error('Grant not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    try {
+      await app.supabaseAdmin.from('audit_events').insert({
+        org_id: orgId,
+        actor_user_id: req.user?.sub || null,
+        type: 'ops.ip_bypass.revoke',
+        note: data.user_id,
+      });
+    } catch (auditError) {
+      app.log.warn(auditError, 'Failed to audit IP bypass revoke');
+    }
+    try {
+      const { invalidateUserOrgCache } = await import('./cache.js');
+      invalidateUserOrgCache(data.user_id, orgId);
+    } catch {}
+    return { ok: true, revokedAt: nowIso };
   });
 
   // Effective permissions for a user at org or department scope
   app.get('/orgs/:orgId/overrides/effective', { preHandler: app.verifyAuth }, async (req) => {
-    const db = req.supabase;
+    const db = app.supabaseAdmin; // Use admin client to bypass RLS since we've already done permission checks
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.manage_members');
+    await ensurePerm(req, 'org.manage_members', app);
     const q = req.query || {};
     const userId = typeof q.userId === 'string' ? q.userId : undefined;
     if (!userId) { const e = new Error('userId required'); e.statusCode = 400; throw e; }
@@ -1801,8 +2477,12 @@ export function registerRoutes(app) {
     let deptParam = undefined;
     if (Object.prototype.hasOwnProperty.call(q, 'departmentId')) {
       const raw = q.departmentId;
+      console.log(`🔍 Debug: Raw departmentId from query: "${raw}" (type: ${typeof raw})`);
       if (raw === 'null' || raw === '' || raw === null) deptParam = null;
       else if (typeof raw === 'string') deptParam = raw;
+      console.log(`🔍 Debug: Processed deptParam: ${deptParam} (type: ${typeof deptParam})`);
+    } else {
+      console.log('🔍 Debug: No departmentId in query parameters');
     }
 
     // Get user's role in the org
@@ -1813,6 +2493,58 @@ export function registerRoutes(app) {
       .eq('user_id', userId)
       .single();
     const roleKey = membership?.role || null;
+
+    // If querying department-specific permissions, check if user is a member of that department
+    if (typeof deptParam === 'string') {
+      // First check if this is the Core team and if the requesting user is an admin
+      const { data: deptInfo } = await db
+        .from('departments')
+        .select('name')
+        .eq('id', deptParam)
+        .eq('org_id', orgId)
+        .single();
+      
+      if (deptInfo?.name === 'Core') {
+        // Check if the requesting user is an org admin
+        const { data: requesterRole } = await db
+          .from('organization_users')
+          .select('role')
+          .eq('org_id', orgId)
+          .eq('user_id', req.user?.sub)
+          .single();
+        
+        if (requesterRole?.role !== 'orgAdmin') {
+          return { 
+            role: roleKey, 
+            rolePermissions: {}, 
+            orgOverride: {}, 
+            deptOverride: {}, 
+            effective: {},
+            note: 'Access denied: Core team is restricted to organization administrators only'
+          };
+        }
+      }
+      
+      const { data: deptMembership } = await db
+        .from('department_users')
+        .select('role')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .eq('department_id', deptParam)
+        .maybeSingle();
+      
+      if (!deptMembership) {
+        // User is not a member of this department - return minimal permissions
+        return { 
+          role: roleKey, 
+          rolePermissions: {}, 
+          orgOverride: {}, 
+          deptOverride: {}, 
+          effective: {},
+          note: 'User is not a member of this department'
+        };
+      }
+    }
     let rolePerms = {};
     if (roleKey) {
       const { data: roleRow } = await db
@@ -1835,15 +2567,35 @@ export function registerRoutes(app) {
     const orgOverride = (orgOverrideRow?.permissions || {});
 
     let deptOverride = {};
+    console.log(`🔍 Debug: deptParam type check - typeof deptParam: ${typeof deptParam}, value: ${deptParam}`);
     if (typeof deptParam === 'string') {
-      const { data: deptOverrideRow } = await db
+      console.log(`🔍 Debug: Looking for dept override - userId: ${userId}, deptId: ${deptParam}, orgId: ${orgId}`);
+      // First, let's see all overrides for this user to debug
+      const { data: allOverrides, error: allError } = await db
         .from('user_access_overrides')
-        .select('permissions')
+        .select('*')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      
+      console.log('🔍 All overrides for user:', allOverrides);
+      
+      const { data: deptOverrideRow, error: deptError } = await db
+        .from('user_access_overrides')
+        .select('permissions, department_id, user_id')
         .eq('org_id', orgId)
         .eq('user_id', userId)
         .eq('department_id', deptParam)
         .maybeSingle();
+      
+      if (deptError) {
+        console.error('❌ Dept override query error:', deptError);
+      } else {
+        console.log('🔍 Dept override query result:', deptOverrideRow);
+      }
+      
       deptOverride = (deptOverrideRow?.permissions || {});
+    } else {
+      console.log(`🔍 Debug: Skipping dept override query because deptParam is not a string (type: ${typeof deptParam})`);
     }
 
     // Combine keys from all sources
@@ -1906,17 +2658,23 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     
     try {
-      const { data: canAccess, error } = await db
-        .rpc('can_access_audit', { p_org_id: orgId });
+      // Get user's department context for permission checking
+      const userId = req.user?.sub;
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
       
-      if (error) {
-        console.error('Error checking audit access:', error);
-        return false;
-      }
+      const userDeptIds = userDepts?.map(d => d.department_id) || [];
+      const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
       
-      return canAccess;
+      // Check if user has audit.read permission (includes overrides) with department context
+      await ensurePerm(req, 'audit.read', app, { departmentId: deptContext });
+      
+      return true;
     } catch (error) {
-      console.error('Error in can-access endpoint:', error);
+      console.error('Error checking audit access:', error);
       return false;
     }
   });
@@ -1924,25 +2682,20 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/audit', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    // Determine if admin; team leads will be allowed but scoped below
-    let isAdmin = false;
-    try { await ensurePerm(req, 'audit.read'); isAdmin = true; } catch { isAdmin = false; }
-    // Double-check access: first check permissions, then check department lead status
-    const { data: canAccess, error: accessErr } = await db
-      .rpc('can_access_audit', { p_org_id: orgId });
     
-    if (accessErr) {
-      console.error('Error checking audit access:', accessErr);
-      const err = new Error('Error checking audit permissions');
-      err.statusCode = 500;
-      throw err;
-    }
+    // Get user's department context for permission checking
+    const userId = req.user?.sub;
+    const { data: userDepts } = await db
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
     
-    if (!canAccess) {
-      const err = new Error('Forbidden - You must be an organization admin, content manager, or department lead to access audit logs');
-      err.statusCode = 403;
-      throw err;
-    }
+    const userDeptIds = userDepts?.map(d => d.department_id) || [];
+    const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+    
+    // Check if user has audit.read permission (includes overrides) with department context
+    await ensurePerm(req, 'audit.read', app, { departmentId: deptContext });
     const { type, actors, from, to, limit = 50, offset = 0, coalesce = '1', excludeSelf = '0' } = req.query || {};
     // Fetch a larger page to allow coalescing without losing items
     const fetchLimit = Math.min(Number(limit) * 3, 600);
@@ -1963,6 +2716,7 @@ export function registerRoutes(app) {
     const events = Array.isArray(raw) ? raw : [];
     // Scope for non-admins: only doc-linked events for their depts OR login events for team users
     let scoped = events;
+    const isAdmin = req.user?.role === 'systemAdmin';
     if (!isAdmin) {
       const userId = req.user?.sub;
       const { data: myDepts } = await db
@@ -2063,8 +2817,30 @@ export function registerRoutes(app) {
     console.log('Documents endpoint called for org:', req.params.orgId, 'user:', req.user?.sub, 'query:', req.query);
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    
     const { q, limit = 10000, offset = 0, departmentId } = req.query || {};
     const userId = req.user?.sub;
+    
+    // Check if user has permission to read documents
+    // First get user's department context for permission checking
+    const { data: userDepts } = await db
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    
+    const userDeptIds = userDepts?.map(d => d.department_id) || [];
+    
+    // Check permission with department context (use first department if multiple)
+    const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+    
+    try {
+      await ensurePerm(req, 'documents.read', app, { departmentId: deptContext });
+    } catch (permError) {
+      // If user doesn't have documents.read permission, return empty documents
+      console.log('User does not have documents.read permission, returning empty documents');
+      return [];
+    }
     
     // Build documents query
     
@@ -2268,6 +3044,29 @@ export function registerRoutes(app) {
   app.get('/orgs/:orgId/documents/:id', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req, reply) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    const userId = req.user?.sub;
+    
+    // Check if user has permission to read documents
+    // First get user's department context for permission checking
+    const { data: userDepts } = await db
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    
+    const userDeptIds = userDepts?.map(d => d.department_id) || [];
+    
+    // Check permission with department context (use first department if multiple)
+    const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+    
+    try {
+      await ensurePerm(req, 'documents.read', app, { departmentId: deptContext });
+    } catch (permError) {
+      // If user doesn't have documents.read permission, return 403
+      reply.code(403);
+      return { error: 'Access denied: You do not have permission to read documents' };
+    }
+    
     const { id } = req.params;
     const { data, error } = await db.from('documents').select('*').eq('org_id', orgId).eq('id', id).maybeSingle();
     if (error) throw error;
@@ -2351,7 +3150,7 @@ export function registerRoutes(app) {
     // Resolve department: non-admins must create within their own department(s)
     let departmentId = body.departmentId || null;
     let isAdmin = false;
-    try { await ensurePerm(req, 'org.manage_members'); isAdmin = true; } catch { isAdmin = false; }
+    try { await ensurePerm(req, 'org.manage_members', app); isAdmin = true; } catch { isAdmin = false; }
     if (!isAdmin) {
       // Load user's departments
       const { data: myDepts } = await db
@@ -2476,7 +3275,7 @@ export function registerRoutes(app) {
     }
     // Log effective permissions snapshot for debugging
     try {
-      const perms = await getEffectivePermissions(req, orgId, { departmentId });
+      const { permissions: perms } = await getEffectivePermissions(req, orgId, app, { departmentId });
       console.log('[DOCS.CREATE] effective perms for user', userId, 'dept', departmentId, perms);
     } catch (e) {
       console.warn('[DOCS.CREATE] failed to compute effective perms', e?.message);
@@ -2550,7 +3349,7 @@ export function registerRoutes(app) {
     const { id } = req.params;
     const { permanent } = req.query || {};
     // Require delete permission (business-level check) and then perform write with service role to avoid RLS WITH CHECK failures
-    await ensurePerm(req, 'documents.delete');
+    await ensurePerm(req, 'documents.delete', app);
 
     const { data: document, error: fetchError } = await app.supabaseAdmin
       .from('documents')
@@ -2594,7 +3393,7 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Require edit permission (RLS on documents will scope to allowed docs)
-    await ensurePerm(req, 'documents.update');
+    await ensurePerm(req, 'documents.update', app);
     const { id } = req.params;
     const { data: doc, error } = await db
       .from('documents')
@@ -2664,9 +3463,9 @@ export function registerRoutes(app) {
     const { ids } = Schema.parse(req.body);
     // Require bulk delete permission (or at least delete)
     try {
-      await ensurePerm(req, 'documents.bulk_delete');
+      await ensurePerm(req, 'documents.bulk_delete', app);
     } catch {
-      await ensurePerm(req, 'documents.delete');
+      await ensurePerm(req, 'documents.delete', app);
     }
     
     // Get all documents to retrieve storage information
@@ -3273,6 +4072,27 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
+    
+    // Check if user has permission to read documents
+    // First get user's department context for permission checking
+    const { data: userDepts } = await db
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    
+    const userDeptIds = userDepts?.map(d => d.department_id) || [];
+    
+    // Check permission with department context (use first department if multiple)
+    const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+    
+    try {
+      await ensurePerm(req, 'documents.read', app, { departmentId: deptContext });
+    } catch (permError) {
+      // If user doesn't have documents.read permission, return empty folders
+      return [];
+    }
+    
     const pathStr = String((req.query?.path || ''));
     const pathArr = pathStr ? pathStr.split('/').filter(Boolean) : [];
 
@@ -3416,7 +4236,7 @@ export function registerRoutes(app) {
     // Check if user is admin
     let isAdmin = false;
     try { 
-      await ensurePerm(req, 'org.manage_members'); 
+      await ensurePerm(req, 'org.manage_members', app); 
       isAdmin = true; 
     } catch { 
       isAdmin = false; 
@@ -3467,7 +4287,7 @@ export function registerRoutes(app) {
           .maybeSingle();
         // If not a member, ensure they have org.manage_members (admin)
         if (!m) {
-          try { await ensurePerm(req, 'org.manage_members'); }
+          try { await ensurePerm(req, 'org.manage_members', app); }
           catch {
             const err = new Error('Not allowed to create folders for other teams');
             err.statusCode = 403; throw err;
@@ -4090,7 +4910,7 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     // Require edit permission (doc-level RLS will further restrict)
     try {
-      await ensurePerm(req, 'documents.update');
+      await ensurePerm(req, 'documents.update', app);
     } catch (error) {
       // Temporary workaround: if permission check fails but user has teamLead role, allow extraction
       const db = req.supabase;
@@ -4216,7 +5036,7 @@ export function registerRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Require storage upload permission
-    await ensurePerm(req, 'storage.upload');
+    await ensurePerm(req, 'storage.upload', app);
     const parts = req.parts();
     let filePart = null;
     for await (const part of parts) {
@@ -4250,7 +5070,7 @@ export function registerRoutes(app) {
     const orgId = await ensureActiveMember(req);
     // Require storage upload permission
     try {
-      await ensurePerm(req, 'storage.upload');
+      await ensurePerm(req, 'storage.upload', app);
     } catch (error) {
       // Temporary workaround: if permission check fails but user has teamLead role, allow upload
       const db = req.supabase;
@@ -6011,6 +6831,14 @@ export function registerRoutes(app) {
         .eq('org_id', orgId)
         .eq('user_id', userId);
       userDepartments = userDepts?.map(d => d.department_id) || [];
+      
+      console.log('Dashboard stats debug:', {
+        userId,
+        isOrgAdmin,
+        userDepts: userDepts?.length || 0,
+        userDepartments: userDepartments.length,
+        deptIds: userDepartments
+      });
     }
 
     const now = new Date();
@@ -6026,16 +6854,25 @@ export function registerRoutes(app) {
 
     if (!isOrgAdmin) {
       if (userDepartments.length > 0) {
-        // User has departments - include docs in their departments OR unassigned docs
-        docQuery = docQuery.or(`department_id.in.(${userDepartments.join(',')}),department_id.is.null`);
+        // User has departments - STRICT: only docs in their departments (NO unassigned access)
+        docQuery = docQuery.in('department_id', userDepartments);
       } else {
-        // User has no departments - only unassigned docs
-        docQuery = docQuery.is('department_id', null);
+        // User has no departments - NO documents visible (use impossible UUID)
+        docQuery = docQuery.eq('department_id', '00000000-0000-0000-0000-000000000000');
       }
     }
 
     const { data: docStats, error: docErr } = await docQuery;
     if (docErr) throw docErr;
+    
+    console.log('Dashboard stats documents query result:', {
+      userId,
+      isOrgAdmin,
+      userDepartments: userDepartments.length,
+      deptIds: userDepartments,
+      docCount: docStats?.length || 0,
+      docDepartments: docStats?.map(d => d.department_id).filter((v, i, a) => a.indexOf(v) === i) || []
+    });
 
     // User stats - for admins show all, for others show department-specific
     let userStatsData;
@@ -6294,7 +7131,7 @@ export function registerRoutes(app) {
 
   app.post('/orgs/:orgId/documents/:id/trash', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'documents.delete');
+    await ensurePerm(req, 'documents.delete', app);
     const { id } = req.params;
     const userId = req.user?.sub;
     const now = new Date();
@@ -6313,7 +7150,7 @@ export function registerRoutes(app) {
 
   app.post('/orgs/:orgId/documents/:id/restore', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'documents.update');
+    await ensurePerm(req, 'documents.update', app);
     const { id } = req.params;
     const { data, error } = await app.supabaseAdmin
       .from('documents')
@@ -6329,7 +7166,7 @@ export function registerRoutes(app) {
 
   app.delete('/orgs/:orgId/documents/:id/permanent', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'documents.delete');
+    await ensurePerm(req, 'documents.delete', app);
     const { id } = req.params;
     // Fetch doc for storage
     const { data: doc } = await app.supabaseAdmin
@@ -6412,7 +7249,10 @@ export function registerRoutes(app) {
     const orgId = req.params.orgId;
     const deptId = req.params.deptId;
     const userId = req.user.id;
-    const isAdmin = req.user.role === 'systemAdmin';
+
+    // Check if user is an admin (either systemAdmin or orgAdmin)
+    const userRole = await getUserOrgRole(req);
+    const isAdmin = userRole === 'orgAdmin' || req.user.role === 'systemAdmin';
 
     // Only admins can update categories
     if (!isAdmin) {
@@ -6423,24 +7263,50 @@ export function registerRoutes(app) {
 
     await ensureActiveMember(req);
 
+    // First, check if the department exists and we have access to it
+    const { data: existingDept, error: checkError } = await app.supabaseAdmin
+      .from('departments')
+      .select('id, name, org_id')
+      .eq('org_id', orgId)
+      .eq('id', deptId)
+      .single();
+
+    if (checkError) {
+      console.error('Department check error:', checkError);
+      const err = new Error(`Department not found. Org: ${orgId}, Dept: ${deptId}`);
+      err.statusCode = 404;
+      throw err;
+    }
+
+    console.log('Found department:', existingDept);
+
     const Schema = z.object({
       categories: z.array(z.string().min(1)).min(1).max(50)
     });
     
     const { categories } = Schema.parse(req.body || {});
 
-    const { data, error } = await db
+    const { data, error } = await app.supabaseAdmin
       .from('departments')
       .update({ categories })
       .eq('org_id', orgId)
       .eq('id', deptId)
-      .select('id, name, categories')
-      .single();
+      .select('id, name, categories');
 
-    if (error) throw error;
+    if (error) {
+      console.error('Department categories update error:', error);
+      throw error;
+    }
 
-    console.log(`📂 Categories updated for department ${data.name}:`, categories);
-    return data;
+    if (!data || data.length === 0) {
+      const err = new Error(`Department not found or access denied. Org: ${orgId}, Dept: ${deptId}`);
+      err.statusCode = 404;
+      throw err;
+    }
+
+    const result = data[0];
+    console.log(`📂 Categories updated for department ${result.name}:`, categories);
+    return result;
   });
 
   // Register all route modules (dashboard, future modules, etc.)
@@ -6453,3 +7319,6 @@ export function registerRoutes(app) {
     console.error('Failed to load metadata routes:', error);
   });
 }
+
+// Export functions that need to be used by other modules
+export { getEffectivePermissions };

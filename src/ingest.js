@@ -133,7 +133,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
       generateJsonFromGeminiFile({
         fileUri: fileInfo.fileUri,
         mimeType: fileInfo.mimeType || effectiveMime,
-        prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). Do not include a summary in this response.`,
+        prompt: `You are an expert document information extractor. Respond strictly as JSON with keys: title, subject, keywords (array, >=3), tags (array, 3-8), sender, receiver, senderOptions (array), receiverOptions (array), documentDate (ISO or empty), category (one of: ${availableCategories.join(', ')}). IMPORTANT: You MUST always select a category from the provided list. If none seem perfect, choose the closest match. Never leave category empty or undefined. Do not include a summary in this response.`,
       }),
       generateJsonFromGeminiFile({
         fileUri: fileInfo.fileUri,
@@ -158,7 +158,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
       senderOptions: Array.isArray(meta?.senderOptions) ? meta.senderOptions : [],
       receiverOptions: Array.isArray(meta?.receiverOptions) ? meta.receiverOptions : [],
       documentDate: typeof meta?.documentDate === 'string' ? meta.documentDate : undefined,
-      category: typeof meta?.category === 'string' ? meta.category : undefined,
+      category: typeof meta?.category === 'string' && meta.category.trim() ? meta.category : (availableCategories.includes('General') ? 'General' : availableCategories[0]),
     };
     try {
       if ((process.env.LOG_SUMMARY_PROMPT || '').toLowerCase() === 'true' || process.env.LOG_SUMMARY_PROMPT === '1') {

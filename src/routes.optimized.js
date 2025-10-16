@@ -212,9 +212,30 @@ async function getMyPermissions(req, orgId) {
   return roleRow?.permissions || {};
 }
 
+async function fetchActiveIpBypassGrant(adminClient, orgId, userId) {
+  if (!userId) return null;
+  const nowIso = new Date().toISOString();
+  const { data, error } = await adminClient
+    .from('ip_bypass_grants')
+    .select('id, expires_at, granted_at, granted_by, note')
+    .eq('org_id', orgId)
+    .eq('user_id', userId)
+    .is('revoked_at', null)
+    .gt('expires_at', nowIso)
+    .order('expires_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  if (!data || data.length === 0) return null;
+  const grant = data[0];
+  if (!grant?.expires_at) return null;
+  if (new Date(grant.expires_at).getTime() <= Date.now()) return null;
+  return grant;
+}
+
 // Merge role permissions with per-user overrides (org-wide and optional dept-specific)
 async function getEffectivePermissions(req, orgId, opts = {}) {
-  const db = req.supabase;
+  const db = req.server?.supabaseAdmin;
+  if (!db) throw new Error('Supabase admin client unavailable');
   const userId = req.user?.sub;
   const deptId = Object.prototype.hasOwnProperty.call(opts, 'departmentId') ? opts.departmentId : undefined;
 
@@ -270,13 +291,35 @@ async function getEffectivePermissions(req, orgId, opts = {}) {
         ? !!orgOverride[k]
         : !!rolePerms[k];
   }
-  return effective;
+  const meta = {
+    security: {
+      ip_bypass: {
+        source: effective['security.ip_bypass'] === true ? 'roleOrOverride' : 'none',
+        expiresAt: null,
+        grantId: null,
+      },
+    },
+  };
+  try {
+    const grant = await fetchActiveIpBypassGrant(db, orgId, userId);
+    if (grant) {
+      effective['security.ip_bypass'] = true;
+      meta.security.ip_bypass = {
+        source: 'timedGrant',
+        expiresAt: grant.expires_at,
+        grantId: grant.id,
+      };
+    }
+  } catch (grantErr) {
+    req.server?.log?.warn(grantErr, 'Failed to fetch IP bypass grant (optimized routes)');
+  }
+  return { permissions: effective, meta };
 }
 
 async function ensurePerm(req, permKey, opts = {}) {
   const orgId = requireOrg(req);
-  const perms = await getEffectivePermissions(req, orgId, opts);
-  if (!perms || perms[permKey] !== true) {
+  const { permissions } = await getEffectivePermissions(req, orgId, opts);
+  if (!permissions || permissions[permKey] !== true) {
     const err = new Error('Forbidden');
     err.statusCode = 403;
     throw err;

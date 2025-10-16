@@ -2,6 +2,7 @@
 // Handles both user preferences and organization-wide settings
 
 import { z } from 'zod';
+import { getEffectivePermissions } from '../routes.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -65,10 +66,24 @@ async function getMyPermissions(req, orgId) {
   return roleRow?.permissions || {};
 }
 
-async function ensurePerm(req, permKey) {
+async function ensurePerm(req, permKey, app) {
   const orgId = requireOrg(req);
-  const perms = await getMyPermissions(req, orgId);
-  if (!perms || perms[permKey] !== true) {
+  
+  // First get user's department context for permission checking
+  const db = req.supabase;
+  const userId = req.user?.sub;
+  const { data: userDepts } = await db
+    .from('department_users')
+    .select('department_id')
+    .eq('org_id', orgId)
+    .eq('user_id', userId);
+  
+  const userDeptIds = userDepts?.map(d => d.department_id) || [];
+  const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+  
+  // Use effective permissions (role + overrides) with department context
+  const { permissions } = await getEffectivePermissions(req, orgId, app, { departmentId: deptContext });
+  if (!permissions || permissions[permKey] !== true) {
     const err = new Error('Forbidden');
     err.statusCode = 403;
     throw err;
@@ -131,6 +146,19 @@ export function registerSettingsRoutes(app) {
   app.get('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
+    // Require permission to read org settings OR team management permissions
+    try {
+      await ensurePerm(req, 'org.update_settings', app);
+    } catch (permError) {
+      // If not org admin, check if they have team management permissions
+      try {
+        await ensurePerm(req, 'departments.manage_members', app);
+      } catch (teamPermError) {
+        // No permissions at all
+        throw permError;
+      }
+    }
+    
     const { data, error } = await db
       .from('org_settings')
       .select('*')
@@ -149,11 +177,11 @@ export function registerSettingsRoutes(app) {
     };
   });
 
-  app.put('/orgs/:orgId/settings', { preHandler: app.verifyAuth }, async (req) => {
+  app.put('/orgs/:orgId/settings', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     // Require permission to update org settings
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
 
     const Schema = z.object({
       date_format: z.string().min(1).optional(),
@@ -172,6 +200,12 @@ export function registerSettingsRoutes(app) {
       .select('*')
       .single();
     if (error) throw error;
+    
+    // Invalidate IP settings cache when settings are updated
+    if (app.invalidateIpSettingsCache) {
+      app.invalidateIpSettingsCache(orgId);
+    }
+    
     return data;
   });
 
@@ -181,7 +215,7 @@ export function registerSettingsRoutes(app) {
     const admin = app.supabaseAdmin;
     const orgId = await ensureActiveMember(req);
     // Restrict to admins who can update org settings
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
 
     const { data, error } = await admin
       .from('org_private_settings')
@@ -202,7 +236,7 @@ export function registerSettingsRoutes(app) {
   app.put('/orgs/:orgId/private-settings', { preHandler: app.verifyAuth }, async (req) => {
     const admin = app.supabaseAdmin;
     const orgId = await ensureActiveMember(req);
-    await ensurePerm(req, 'org.update_settings');
+    await ensurePerm(req, 'org.update_settings', app);
 
     const Schema = z.object({
       summary_prompt: z.string().min(10).max(3000),

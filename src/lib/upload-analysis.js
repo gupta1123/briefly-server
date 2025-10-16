@@ -403,7 +403,7 @@ Respond as JSON with two keys:
     generateJsonFromGeminiFile({
       fileUri: geminiReference.fileUri,
       mimeType: geminiReference.mimeType || effectiveMime,
-      prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. Always produce JSON matching the provided schema.`,
+      prompt: `You are an expert document information extractor. Fill all fields while respecting the allowed category list: ${availableCategories.join(', ')}. IMPORTANT: You MUST always select a category from the provided list. If none seem perfect, choose the closest match. Never leave category empty or undefined. Always produce JSON matching the provided schema.`,
       responseSchema: {
         ...GEMINI_META_SCHEMA,
         properties: {
