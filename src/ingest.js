@@ -12,6 +12,18 @@ function sanitizeFilename(name) {
   }
 }
 
+function combineSummaryWithKeyPointers(summary, pointers) {
+  const text = typeof summary === 'string' ? summary.trim() : '';
+  const items = Array.isArray(pointers)
+    ? pointers.map((p) => (typeof p === 'string' ? p.trim() : '')).filter(Boolean)
+    : [];
+  if (!text && items.length === 0) return '';
+  if (items.length === 0) return text;
+  const bullets = items.map((p) => `• ${p}`).join('\n');
+  if (!text) return `Key Points:\n${bullets}`;
+  return `${text}\n\nKey Points:\n${bullets}`;
+}
+
 // Batch processing multiple documents in parallel
 export async function ingestDocumentsBatch(app, documents) {
   const log = app.log || console;
@@ -122,6 +134,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
   let ocrPages = [];
   let metadata = {};
   let summaryText = '';
+  let keyPointers = [];
   try {
     // Process all Gemini calls in parallel for 3x speed improvement
     const [ocr, meta, sum] = await Promise.all([
@@ -146,13 +159,18 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
     ocrText = typeof ocr?.extractedText === 'string' && ocr.extractedText.trim().length > 0
       ? ocr.extractedText
       : (Array.isArray(ocrPages) ? ocrPages.map((p) => String(p.text || '')).join('\n\n') : '');
-    summaryText = (sum && typeof sum.summary === 'string') ? sum.summary : '';
+    const rawSummary = (sum && typeof sum.summary === 'string') ? sum.summary : '';
+    keyPointers = Array.isArray(sum?.keyPointers)
+      ? sum.keyPointers.map((p) => (typeof p === 'string' ? p.trim() : '')).filter(Boolean)
+      : [];
+    summaryText = combineSummaryWithKeyPointers(rawSummary, keyPointers);
     metadata = {
       title: (meta && typeof meta.title === 'string' && meta.title.trim()) ? meta.title : baseName,
       subject: (meta && typeof meta.subject === 'string' && meta.subject.trim()) ? meta.subject : baseName,
       keywords: Array.from(new Set((Array.isArray(meta?.keywords) ? meta.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
       tags: Array.from(new Set((Array.isArray(meta?.tags) ? meta.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
       summary: summaryText,
+      keyPointers,
       sender: typeof meta?.sender === 'string' ? meta.sender : undefined,
       receiver: typeof meta?.receiver === 'string' ? meta.receiver : undefined,
       senderOptions: Array.isArray(meta?.senderOptions) ? meta.senderOptions : [],
@@ -205,7 +223,7 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
   try {
     const { data: doc } = await app.supabaseAdmin
       .from('documents')
-      .select('title, subject, category, tags, keywords, sender, receiver, document_date')
+      .select('title, subject, description, category, tags, keywords, sender, receiver, document_date')
       .eq('org_id', orgId)
       .eq('id', docId)
       .maybeSingle();
@@ -218,6 +236,14 @@ export async function ingestDocument(app, { orgId, docId, storageKey, mimeType, 
       if ((!doc.keywords || doc.keywords.length === 0) && Array.isArray(metadata.keywords)) payload.keywords = metadata.keywords;
       if (!doc.sender && metadata.sender) payload.sender = metadata.sender;
       if (!doc.receiver && metadata.receiver) payload.receiver = metadata.receiver;
+      if (summaryText) {
+        const currentDescription = typeof doc.description === 'string' ? doc.description.trim() : '';
+        const looksAuto =
+          !currentDescription ||
+          /^Large [A-Z0-9]+ file \(/.test(currentDescription) ||
+          currentDescription === metadata.summary;
+        if (looksAuto) payload.description = summaryText;
+      }
       if (!doc.document_date && metadata.documentDate) {
         const norm = normalizeDate(metadata.documentDate);
         if (norm) payload.document_date = norm;

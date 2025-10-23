@@ -288,6 +288,18 @@ function determineCategoryForLargeFile(fileExtension, availableCategories) {
   return availableCategories.includes('General') ? 'General' : availableCategories[0];
 }
 
+function combineSummaryWithKeyPointers(summary, pointers) {
+  const text = typeof summary === 'string' ? summary.trim() : '';
+  const items = Array.isArray(pointers)
+    ? pointers.map((p) => (typeof p === 'string' ? p.trim() : '')).filter(Boolean)
+    : [];
+  if (!text && items.length === 0) return '';
+  if (items.length === 0) return text;
+  const bullets = items.map((p) => `• ${p}`).join('\n');
+  if (!text) return `Key Points:\n${bullets}`;
+  return `${text}\n\nKey Points:\n${bullets}`;
+}
+
 async function performUploadAnalysis(app, { orgId, storageKey, mimeType }) {
   const log = app.log || console;
   const availableCategories = await loadOrgSettings(app, orgId);
@@ -470,7 +482,9 @@ Respond as JSON with two keys:
   if (sumResult.status === 'fulfilled' && typeof sumResult.value?.summary === 'string') {
     summaryText = sumResult.value.summary;
     if (Array.isArray(sumResult.value?.keyPointers)) {
-      keyPointers = sumResult.value.keyPointers.filter((item) => typeof item === 'string' && item.trim());
+      keyPointers = sumResult.value.keyPointers
+        .map((item) => (typeof item === 'string' ? item.trim() : ''))
+        .filter(Boolean);
     }
   } else {
     usedFallback = true;
@@ -479,12 +493,14 @@ Respond as JSON with two keys:
     keyPointers = [];
   }
 
+  const combinedSummary = combineSummaryWithKeyPointers(summaryText || '', keyPointers);
+
   metadata = {
     title: (metadata && typeof metadata.title === 'string' && metadata.title.trim()) ? metadata.title : defaultMetadata().title,
     subject: (metadata && typeof metadata.subject === 'string' && metadata.subject.trim()) ? metadata.subject : defaultMetadata().subject,
     keywords: Array.from(new Set((Array.isArray(metadata?.keywords) ? metadata.keywords : []).filter(Boolean).map((k) => String(k)).slice(0, 10).concat([baseName]))).slice(0, 10),
     tags: Array.from(new Set((Array.isArray(metadata?.tags) ? metadata.tags : []).filter(Boolean).map((k) => String(k)).slice(0, 8).concat(['document']))).slice(0, 8),
-    summary: summaryText || '',
+    summary: combinedSummary,
     keyPointers,
     sender: typeof metadata?.sender === 'string' ? metadata.sender : undefined,
     receiver: typeof metadata?.receiver === 'string' ? metadata.receiver : undefined,
