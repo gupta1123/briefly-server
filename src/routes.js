@@ -45,6 +45,72 @@ async function ensureActiveMember(req) {
   return orgId;
 }
 
+/**
+ * Smart department selection logic:
+ * 1. Prefer non-Core and non-General departments
+ * 2. If only General is available, use General
+ * 3. If only Core is available, use Core
+ * 4. If multiple non-Core/non-General available, use the first one
+ */
+async function selectSmartDepartment(db, orgId, departmentIds) {
+  if (!departmentIds || departmentIds.length === 0) return null;
+  if (departmentIds.length === 1) return departmentIds[0];
+
+  try {
+    // Get department names for the provided IDs
+    const { data: departments, error } = await db
+      .from('departments')
+      .select('id, name')
+      .eq('org_id', orgId)
+      .in('id', departmentIds);
+
+    if (error) {
+      console.error('❌ Error fetching departments for smart selection:', error);
+      return departmentIds[0]; // Fallback to first ID
+    }
+
+    if (!departments || departments.length === 0) {
+      return departmentIds[0]; // Fallback to first ID
+    }
+
+    // Create a map for quick lookup
+    const deptMap = new Map(departments.map(d => [d.id, d.name.toLowerCase()]));
+
+    // Priority 1: Find non-Core and non-General departments
+    const preferredDepts = departmentIds.filter(id => {
+      const name = deptMap.get(id);
+      return name && name !== 'core' && name !== 'general';
+    });
+
+    if (preferredDepts.length > 0) {
+      console.log(`✅ [SMART_SELECTION] Selected preferred department: ${deptMap.get(preferredDepts[0])} (${preferredDepts[0]})`);
+      return preferredDepts[0];
+    }
+
+    // Priority 2: If only General is available, use General
+    const generalDept = departmentIds.find(id => deptMap.get(id) === 'general');
+    if (generalDept) {
+      console.log(`✅ [SMART_SELECTION] Selected General department: ${generalDept}`);
+      return generalDept;
+    }
+
+    // Priority 3: If only Core is available, use Core
+    const coreDept = departmentIds.find(id => deptMap.get(id) === 'core');
+    if (coreDept) {
+      console.log(`✅ [SMART_SELECTION] Selected Core department: ${coreDept}`);
+      return coreDept;
+    }
+
+    // Fallback: Use first department
+    console.log(`⚠️ [SMART_SELECTION] No preferred department found, using first: ${departmentIds[0]}`);
+    return departmentIds[0];
+
+  } catch (error) {
+    console.error('❌ Error in smart department selection:', error);
+    return departmentIds[0]; // Fallback to first ID
+  }
+}
+
 function toDbDocumentFields(draft) {
   const out = {};
   if (!draft || typeof draft !== 'object') return out;
@@ -3198,12 +3264,17 @@ export function registerRoutes(app) {
           }
         }
 
-        // If still no department, use the single membership or require selection
+        // If still no department, use smart selection logic
         if (!departmentId) {
-          if (uniq.length === 1) departmentId = uniq[0];
-          else {
-            const err = new Error('Please select a team to create this document');
-            err.statusCode = 400; throw err;
+          if (uniq.length === 1) {
+            departmentId = uniq[0];
+          } else {
+            // Smart department selection: prefer non-Core/non-General teams
+            departmentId = await selectSmartDepartment(db, orgId, uniq);
+            if (!departmentId) {
+              const err = new Error('Please select a team to create this document');
+              err.statusCode = 400; throw err;
+            }
           }
         }
       }
@@ -3240,7 +3311,7 @@ export function registerRoutes(app) {
           }
         }
 
-        // If still no department, use admin's department memberships
+        // If still no department, use admin's department memberships with smart selection
         if (!departmentId) {
           const { data: adminDepts } = await db
             .from('department_users')
@@ -3249,8 +3320,17 @@ export function registerRoutes(app) {
             .eq('user_id', userId);
 
           if (adminDepts && adminDepts.length > 0) {
-            // Use the first department the admin is a member of
-            departmentId = adminDepts[0].department_id;
+            const adminDeptIds = adminDepts.map(d => d.department_id);
+            if (adminDeptIds.length === 1) {
+              departmentId = adminDeptIds[0];
+            } else {
+              // Smart department selection for admins: prefer non-Core/non-General teams
+              departmentId = await selectSmartDepartment(db, orgId, adminDeptIds);
+              if (!departmentId) {
+                // Fallback to first department if smart selection fails
+                departmentId = adminDeptIds[0];
+              }
+            }
           } else {
             // Admin has no department memberships - require explicit selection
             const err = new Error('Please select a department for this document. You are not a member of any departments.');
@@ -6648,8 +6728,8 @@ export function registerRoutes(app) {
       const { data, error } = await db.rpc('match_doc_chunks', {
         p_org_id: orgId,
         p_query_embedding: embedding,
-        p_match_count: 24,
-        p_similarity_threshold: 0
+        p_match_count: 8,
+        p_similarity_threshold: 0.4
       });
       if (error) req.log.warn(error, 'match_doc_chunks failed');
       chunks = Array.isArray(data) ? data : [];
