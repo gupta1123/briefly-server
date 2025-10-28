@@ -208,11 +208,11 @@ export async function hybridSearch(db, orgId, query, options = {}) {
       metadataResults, contentResults, keywordResults, orgId, options
     );
     
-    // Final quality check: only return results with meaningful relevance
-    // Lower the threshold to 0.2 (20%) to show more results
+    // Final quality check: only return results with high relevance
+    // Use stricter threshold of 0.5 (50%) for quality results
     const highQualityResults = combinedResults.filter(result => {
-      // At least one source must have >20% similarity for the result to be meaningful
-      return result.max_score >= 0.2;
+      // At least one source must have >50% similarity for the result to be meaningful
+      return result.max_score >= 0.5;
     });
     
     // If we don't have any results at all, return empty array
@@ -241,8 +241,8 @@ async function searchMetadataEmbeddings(db, orgId, queryEmbedding, options) {
   if (!queryEmbedding) return [];
   
   try {
-    // Use more relaxed similarity threshold (0.2 = 20% minimum relevance to show more results)
-    const similarityThreshold = options.threshold || 0.2;
+    // Use stricter similarity threshold (0.4 = 40% minimum relevance for quality results)
+    const similarityThreshold = options.threshold || 0.4;
     
     const { data, error } = await db.rpc('search_metadata_embeddings', {
       p_org_id: orgId,
@@ -257,12 +257,12 @@ async function searchMetadataEmbeddings(db, orgId, queryEmbedding, options) {
       return [];
     }
     
-    // Filter results to only include reasonably relevant matches
+    // Filter results to only include highly relevant matches
     const filteredResults = (data || []).filter(result => {
       const similarity = parseFloat(result.similarity) || 0;
-      // Only include results with meaningful similarity (>40%)
-      // This is stricter than the database threshold to ensure quality
-      return similarity >= Math.max(similarityThreshold, 0.4);
+      // Only include results with high similarity (>50%)
+      // This ensures only the most relevant results are returned
+      return similarity >= Math.max(similarityThreshold, 0.5);
     });
     
     return filteredResults;

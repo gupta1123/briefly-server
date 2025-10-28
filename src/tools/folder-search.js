@@ -19,7 +19,7 @@ export async function folderSearch({ app, db, orgId, folderPath = [], question, 
   let ranked = [];
   try {
     const { hybridSearch } = await import('../lib/metadata-embeddings.js');
-    const res = await hybridSearch(db, orgId, question, { limit: 50, threshold: 0.25 });
+    const res = await hybridSearch(db, orgId, question, { limit: 10, threshold: 0.5 });
     ranked = (res || []).filter(r => allowedDocIds.has(r.doc_id));
   } catch {
     ranked = [];

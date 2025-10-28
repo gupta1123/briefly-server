@@ -199,6 +199,9 @@ export function formatAgnoResponse(data, question) {
       executionTrace: Array.isArray(data.executionTrace) ? data.executionTrace : [],
       sessionId: data.sessionId,
       considered: data.considered || { docIds: [] },
+      tools: Array.isArray(data.tools) ? data.tools : [],
+      processingSteps: Array.isArray(data.processingSteps) ? data.processingSteps : [],
+      reasoning: typeof data.reasoning === 'string' ? data.reasoning : null,
       error: Boolean(data.error),
       raw: data.raw,
       is_complete: true
