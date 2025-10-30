@@ -33,8 +33,8 @@ export function registerStreamingTestAgentRoutes(app) {
       memory: z
         .object({
           focusDocIds: z.array(z.string()).optional(),
-          lastCitedDocIds: z.array(z.string()).optional(),
-          lastListDocIds: z.array(z.string()).optional(),
+          lastCitedDocIds: z.array(z.string().nullable()).optional(),
+          lastListDocIds: z.array(z.string().nullable()).optional(),
           sessionId: z.string().optional(),
         })
         .optional(),
@@ -47,7 +47,14 @@ export function registerStreamingTestAgentRoutes(app) {
       strictCitations: z.boolean().optional(),
     });
 
-    const { question, conversation = [], memory: userMemory = {}, filters = {}, strictCitations } = Schema.parse(req.body || {});
+    const body = req.body || {};
+    if (body?.memory?.lastListDocIds && Array.isArray(body.memory.lastListDocIds)) {
+      body.memory.lastListDocIds = body.memory.lastListDocIds.filter(Boolean);
+    }
+    if (body?.memory?.lastCitedDocIds && Array.isArray(body.memory.lastCitedDocIds)) {
+      body.memory.lastCitedDocIds = body.memory.lastCitedDocIds.filter(Boolean);
+    }
+    const { question, conversation = [], memory: userMemory = {}, filters = {}, strictCitations } = Schema.parse(body);
 
     try {
       const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
@@ -210,8 +217,8 @@ export function registerStreamingTestAgentRoutes(app) {
       memory: z
         .object({
           focusDocIds: z.array(z.string()).optional(),
-          lastCitedDocIds: z.array(z.string()).optional(),
-          lastListDocIds: z.array(z.string()).optional(),
+          lastCitedDocIds: z.array(z.string().nullable()).optional(),
+          lastListDocIds: z.array(z.string().nullable()).optional(),
           filters: z
             .object({ sender: z.string().optional(), receiver: z.string().optional(), docType: z.string().optional() })
             .optional(),
@@ -236,7 +243,14 @@ export function registerStreamingTestAgentRoutes(app) {
       webSearchEnabled: z.boolean().optional().default(false),
     });
 
-    const { question, conversation = [], memory: userMemory = {}, context = { scope: 'org' }, filters = {}, strictCitations, webSearchEnabled } = Schema.parse(req.body || {});
+    const body = req.body || {};
+    if (body?.memory?.lastListDocIds && Array.isArray(body.memory.lastListDocIds)) {
+      body.memory.lastListDocIds = body.memory.lastListDocIds.filter(Boolean);
+    }
+    if (body?.memory?.lastCitedDocIds && Array.isArray(body.memory.lastCitedDocIds)) {
+      body.memory.lastCitedDocIds = body.memory.lastCitedDocIds.filter(Boolean);
+    }
+    const { question, conversation = [], memory: userMemory = {}, context = { scope: 'org' }, filters = {}, strictCitations, webSearchEnabled } = Schema.parse(body);
 
     try {
       const normalizedMemory = userMemory && typeof userMemory === 'object' ? userMemory : {};
