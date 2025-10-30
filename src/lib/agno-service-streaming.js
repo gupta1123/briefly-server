@@ -102,7 +102,9 @@ export async function* callAgnoChatStream({
             if (line.startsWith('data: ')) {
               try {
                 const data = JSON.parse(line.slice(6));
-                console.log('SSE data parsed:', data.type, data);
+                if (process.env.DEBUG_SSE === '1' || process.env.DEBUG_SSE === 'true') {
+                  console.log('SSE data parsed:', data.type, data);
+                }
                 const formatted = formatAgnoResponse(data, question);
                 if (formatted) {
                   yield formatted;

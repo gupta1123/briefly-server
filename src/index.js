@@ -10,7 +10,6 @@ import { registerRoutes } from './routes.js';
 import { registerSimpleOrgsRoute } from './routes/simple-orgs.js';
 import { registerSimpleOrgsTestRoute } from './routes/test-simple-orgs.js';
 import { registerSimplifiedOpsRoutes } from './routes/simple-ops.js';
-import EnhancedAgentOrchestrator from './agents/enhanced-orchestrator.js';
 import { ipValidationPlugin } from './ip-validation.js';
 
 async function main() {
@@ -78,16 +77,7 @@ async function main() {
 
   registerRoutes(app);
 
-  // Pre-initialize enhanced orchestrator only to avoid duplicate prompt registrations
-  try {
-    const orchestrator = new EnhancedAgentOrchestrator();
-    if (orchestrator?.initializeAgents) {
-      await orchestrator.initializeAgents(app.supabaseAdmin);
-      app.log.info('Enhanced agent orchestrator pre-initialized');
-    }
-  } catch (e) {
-    app.log.warn(e, 'Enhanced agent orchestrator pre-initialize failed');
-  }
+  // Orchestrator removed; agno-service handles agent orchestration
 
   // Register simple orgs route
   registerSimpleOrgsRoute(app);

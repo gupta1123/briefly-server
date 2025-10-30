@@ -3,8 +3,6 @@
 
 import { registerDashboardRoutes } from './dashboard.js';
 import { registerSettingsRoutes } from './settings.js';
-import { registerAgentRoutes } from './agents.js';
-import { registerTestAgentRoutes } from './test-agent.js';
 import { registerStreamingTestAgentRoutes } from './test-agent-streaming.js';
 
 /**
@@ -18,11 +16,7 @@ export function registerAllRoutes(app) {
   // Register settings routes
   registerSettingsRoutes(app);
 
-  // Register enhanced agent routes
-  registerAgentRoutes(app);
-
-  // Register test agent routes
-  registerTestAgentRoutes(app);
+  // Removed non-stream agent routes; orchestration lives in agno-service
 
   // Register streaming test agent routes
   registerStreamingTestAgentRoutes(app);
