@@ -5,6 +5,7 @@ import { ingestDocument } from './ingest.js';
 import { registerAllRoutes } from './routes/index.js';
 import { registerMetadataRoutes } from './routes/metadata.js';
 import { initUploadAnalysisQueue, enqueueUploadAnalysisJob, getUploadAnalysisJob } from './lib/upload-analysis-queue.js';
+import { getCompleteRolePermissions } from './lib/permission-helpers.js';
 
 function requireOrg(req) {
   const orgId = req.headers['x-org-id'] || req.params?.orgId;
@@ -358,11 +359,18 @@ async function getEffectivePermissions(req, orgId, app, opts = {}) {
   ]);
   const effective = {};
   for (const k of keys) {
-    effective[k] = Object.prototype.hasOwnProperty.call(deptOverride, k)
-      ? !!deptOverride[k]
-      : Object.prototype.hasOwnProperty.call(orgOverride, k)
-        ? !!orgOverride[k]
-        : !!rolePerms[k];
+    // Handle string values for permissions like dashboard.view
+    const deptHasKey = Object.prototype.hasOwnProperty.call(deptOverride, k);
+    const orgHasKey = Object.prototype.hasOwnProperty.call(orgOverride, k);
+    const roleHasKey = Object.prototype.hasOwnProperty.call(rolePerms, k);
+    
+    if (deptHasKey) {
+      effective[k] = deptOverride[k];
+    } else if (orgHasKey) {
+      effective[k] = orgOverride[k];
+    } else if (roleHasKey) {
+      effective[k] = rolePerms[k];
+    }
   }
 
   const meta = {
@@ -641,86 +649,101 @@ export function registerRoutes(app) {
     try {
       const defaults = [
         { key: 'orgAdmin', name: 'Organization Admin', is_system: true, permissions: {
-          'org.manage_members': true,
-          'org.update_settings': true,
-          'security.ip_bypass': true,
-          'documents.read': true,
-          'documents.create': true,
-          'documents.update': true,
-          'documents.delete': true,
-          'documents.move': true,
-          'documents.link': true,
-          'documents.version.manage': true,
-          'documents.bulk_delete': true,
-          'storage.upload': true,
-          'search.semantic': true,
-          'audit.read': true,
+          ...getCompleteRolePermissions({
+            'org.manage_members': true,
+            'org.update_settings': true,
+            'security.ip_bypass': true,
+            'documents.read': true,
+            'documents.create': true,
+            'documents.update': true,
+            'documents.delete': true,
+            'documents.move': true,
+            'documents.link': true,
+            'documents.version.manage': true,
+            'documents.bulk_delete': true,
+            'storage.upload': true,
+            'search.semantic': true,
+            'audit.read': true,
+          }),
+          'dashboard.view': 'admin'  // OrgAdmin gets admin dashboard by default
         } },
         { key: 'contentManager', name: 'Content Manager', is_system: true, permissions: {
-          'org.manage_members': false,
-          'org.update_settings': false,
-          'security.ip_bypass': false,
-          'documents.read': true,
-          'documents.create': true,
-          'documents.update': true,
-          'documents.delete': true,
-          'documents.move': true,
-          'documents.link': true,
-          'documents.version.manage': true,
-          'documents.bulk_delete': true,
-          'storage.upload': true,
-          'search.semantic': true,
-          'audit.read': true,
+          ...getCompleteRolePermissions({
+            'org.manage_members': false,
+            'org.update_settings': false,
+            'security.ip_bypass': false,
+            'documents.read': true,
+            'documents.create': true,
+            'documents.update': true,
+            'documents.delete': true,
+            'documents.move': true,
+            'documents.link': true,
+            'documents.version.manage': true,
+            'documents.bulk_delete': true,
+            'storage.upload': true,
+            'search.semantic': true,
+            'audit.read': true,
+          }),
+          'dashboard.view': 'regular'  // ContentManager gets regular dashboard (role-based)
         } },
         { key: 'member', name: 'Member', is_system: true, permissions: {
-          'org.manage_members': false,
-          'org.update_settings': false,
-          'security.ip_bypass': false,
-          'documents.read': true,
-          'documents.create': true,
-          'documents.update': true,
-          'documents.delete': true,
-          'documents.move': true,
-          'documents.link': true,
-          'documents.version.manage': true,
-          'documents.bulk_delete': false,
-          'storage.upload': true,
-          'search.semantic': true,
-          'audit.read': false,
+          ...getCompleteRolePermissions({
+            'org.manage_members': false,
+            'org.update_settings': false,
+            'security.ip_bypass': false,
+            'documents.read': true,
+            'documents.create': true,
+            'documents.update': true,
+            'documents.delete': true,
+            'documents.move': true,
+            'documents.link': true,
+            'documents.version.manage': true,
+            'documents.bulk_delete': false,
+            'storage.upload': true,
+            'search.semantic': true,
+            'audit.read': false,
+          }),
+          'dashboard.view': 'regular'  // Member gets regular dashboard (role-based)
         } },
         { key: 'teamLead', name: 'Team Lead', is_system: true, permissions: {
-          'org.manage_members': false,
-          'org.update_settings': false,
-          'security.ip_bypass': false,
-          'documents.read': true,
-          'documents.create': true,
-          'documents.update': true,
-          'documents.delete': true,
-          'documents.move': true,
-          'documents.link': true,
-          'documents.version.manage': true,
-          'documents.bulk_delete': false,
-          'storage.upload': true,
-          'search.semantic': true,
-          'audit.read': true,
-          'departments.read': true,
-          'departments.manage_members': true,
+          ...getCompleteRolePermissions({
+            'org.manage_members': false,
+            'org.update_settings': false,
+            'security.ip_bypass': false,
+            'documents.read': true,
+            'documents.create': true,
+            'documents.update': true,
+            'documents.delete': true,
+            'documents.move': true,
+            'documents.link': true,
+            'documents.version.manage': true,
+            'documents.bulk_delete': false,
+            'storage.upload': true,
+            'search.semantic': true,
+            'audit.read': true,
+            'departments.read': true,
+            'departments.manage_members': true,
+          }),
+          'dashboard.view': 'regular'  // TeamLead gets regular dashboard (role-based)
         } },
         { key: 'contentViewer', name: 'Content Viewer', is_system: true, permissions: {
-          'org.manage_members': false,
-          'org.update_settings': false,
-          'security.ip_bypass': false,
-          'documents.read': true,
-          'documents.create': false,
-          'documents.update': false,
-          'documents.delete': false,
-          'documents.move': false,
-          'documents.link': false,
-          'documents.version.manage': false,
-          'documents.bulk_delete': false,
-          'storage.upload': false,
-          'search.semantic': true,
-          'audit.read': true,
+          ...getCompleteRolePermissions({
+            'org.manage_members': false,
+            'org.update_settings': false,
+            'security.ip_bypass': false,
+            'documents.read': true,
+            'documents.create': false,
+            'documents.update': false,
+            'documents.delete': false,
+            'documents.move': false,
+            'documents.link': false,
+            'documents.version.manage': false,
+            'documents.bulk_delete': false,
+            'storage.upload': false,
+            'search.semantic': true,
+            'audit.read': true,
+          }),
+          'dashboard.view': 'regular'  // ContentViewer gets regular dashboard (role-based)
         } },
       ];
       for (const r of defaults) {
@@ -1546,7 +1569,7 @@ export function registerRoutes(app) {
     const body = Schema.parse(req.body || {});
     const { data: existing } = await db
       .from('org_roles')
-      .select('is_system, key')
+      .select('is_system, key, permissions')
       .eq('org_id', orgId)
       .eq('key', key)
       .maybeSingle();
@@ -1555,7 +1578,22 @@ export function registerRoutes(app) {
       err.statusCode = 404;
       throw err;
     }
-    const payload = { ...body };
+    
+    let payload = { ...body };
+    
+    // If permissions are being updated, ensure page permissions are recalculated
+    if (body.permissions) {
+      // Merge with existing permissions to preserve any that weren't updated
+      const mergedPermissions = {
+        ...(existing.permissions || {}),
+        ...body.permissions
+      };
+      
+      // Recalculate page permissions based on functional permissions
+      const completePermissions = getCompleteRolePermissions(mergedPermissions);
+      payload.permissions = completePermissions;
+    }
+    
     const { data, error } = await db
       .from('org_roles')
       .update(payload)
@@ -2309,7 +2347,12 @@ export function registerRoutes(app) {
   app.put('/orgs/:orgId/overrides', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
-    const Schema = z.object({ userId: z.string().uuid(), departmentId: z.string().uuid().nullable().optional(), permissions: z.record(z.boolean()) });
+    // Allow both boolean and string values for permissions (for dashboard.view which is 'admin' | 'regular')
+    const Schema = z.object({ 
+      userId: z.string().uuid(), 
+      departmentId: z.string().uuid().nullable().optional(), 
+      permissions: z.record(z.union([z.boolean(), z.string()]))
+    });
     const body = Schema.parse(req.body || {});
     
     // Check if user has permission to manage overrides
@@ -2735,13 +2778,94 @@ export function registerRoutes(app) {
       const userDeptIds = userDepts?.map(d => d.department_id) || [];
       const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
       
-      // Check if user has audit.read permission (includes overrides) with department context
-      await ensurePerm(req, 'audit.read', app, { departmentId: deptContext });
-      
-      return true;
+      // Check page permission (preferred), with fallback to audit.read for backward compatibility
+      try {
+        await ensurePerm(req, 'pages.activity', app, { departmentId: deptContext });
+        return true;
+      } catch {
+        // Fallback: check audit.read permission for backward compatibility
+        await ensurePerm(req, 'audit.read', app, { departmentId: deptContext });
+        return true;
+      }
     } catch (error) {
       console.error('Error checking audit access:', error);
       return false;
+    }
+  });
+
+  // Check if user can access pages
+  app.get('/orgs/:orgId/pages/can-access', { preHandler: app.verifyAuth }, async (req) => {
+    const db = req.supabase;
+    const orgId = await ensureActiveMember(req);
+    const { page } = req.query || {};
+    
+    if (!page || typeof page !== 'string') {
+      const err = new Error('page query parameter required');
+      err.statusCode = 400;
+      throw err;
+    }
+    
+    // Map page names to permission keys
+    const pagePermissionMap = {
+      'upload': 'pages.upload',
+      'documents': 'pages.documents',
+      'folders': 'pages.documents',
+      'activity': 'pages.activity',
+      'audit': 'pages.activity',
+      'recycle-bin': 'pages.recycle_bin',
+      'recycle_bin': 'pages.recycle_bin',
+      'chat': 'pages.chat',
+      'chatbot': 'pages.chat',
+    };
+    
+    const permKey = pagePermissionMap[page.toLowerCase()];
+    if (!permKey) {
+      const err = new Error(`Unknown page: ${page}`);
+      err.statusCode = 400;
+      throw err;
+    }
+    
+    try {
+      // Get user's department context for permission checking
+      const userId = req.user?.sub;
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      
+      const userDeptIds = userDepts?.map(d => d.department_id) || [];
+      const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+      
+      // Check page permission
+      await ensurePerm(req, permKey, app, { departmentId: deptContext });
+      return { canAccess: true, page, permission: permKey };
+    } catch (error) {
+      // Check fallback permissions for backward compatibility
+      let fallbackPerm = null;
+      if (page === 'activity' || page === 'audit') {
+        fallbackPerm = 'audit.read';
+      } else if (page === 'documents' || page === 'folders') {
+        fallbackPerm = 'documents.read';
+      } else if (page === 'upload') {
+        fallbackPerm = 'documents.create';
+      } else if (page === 'recycle-bin' || page === 'recycle_bin') {
+        // Check org.manage_members OR documents.delete
+        const perms = await getMyPermissions(req, orgId);
+        const canAccess = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
+        return { canAccess, page, permission: permKey, fallback: true };
+      }
+      
+      if (fallbackPerm) {
+        try {
+          await ensurePerm(req, fallbackPerm, app, { departmentId: deptContext });
+          return { canAccess: true, page, permission: permKey, fallback: true };
+        } catch {
+          return { canAccess: false, page, permission: permKey };
+        }
+      }
+      
+      return { canAccess: false, page, permission: permKey };
     }
   });
 
@@ -5247,6 +5371,32 @@ export function registerRoutes(app) {
     const userId = req.user?.sub;
     const role = await getUserOrgRole(req);
     
+    // Get user's effective permissions to check dashboard level
+    let dashboardLevel = 'regular';
+    try {
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      const userDeptIds = userDepts?.map(d => d.department_id) || [];
+      const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+      
+      const permResult = await getEffectivePermissions(req, orgId, app, { departmentId: deptContext });
+      const permissions = permResult?.permissions || {};
+      dashboardLevel = permissions['dashboard.view'] || 'regular';
+    } catch (error) {
+      console.warn('Failed to get effective permissions for dashboard, falling back to role-based:', error);
+      // Fallback to role-based
+      const { data: userRole } = await db
+        .from('organization_users')
+        .select('role')
+        .eq('org_id', orgId)
+        .eq('user_id', userId)
+        .single();
+      dashboardLevel = userRole?.role === 'orgAdmin' ? 'admin' : 'regular';
+    }
+    
     // Check user's role and department access
     const { data: userRole } = await db
       .from('organization_users')
@@ -5256,10 +5406,12 @@ export function registerRoutes(app) {
       .single();
     
     const isOrgAdmin = userRole?.role === 'orgAdmin';
+    const hasAdminDashboard = dashboardLevel === 'admin';
+    const shouldShowOrgWideStats = hasAdminDashboard || isOrgAdmin;
     
-    // Get user's departments for non-admin users
+    // Get user's departments for non-admin dashboard users
     let userDepartments = [];
-    if (!isOrgAdmin) {
+    if (!shouldShowOrgWideStats) {
       const { data: userDepts } = await db
         .from('department_users')
         .select('department_id')
@@ -5269,7 +5421,10 @@ export function registerRoutes(app) {
       
       console.log('Dashboard stats debug:', {
         userId,
+        dashboardLevel,
         isOrgAdmin,
+        hasAdminDashboard,
+        shouldShowOrgWideStats,
         userDepts: userDepts?.length || 0,
         userDepartments: userDepartments.length,
         deptIds: userDepartments
@@ -5280,14 +5435,15 @@ export function registerRoutes(app) {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-    // Document stats - filter by department for non-admins and exclude folder placeholders
+    // Document stats - filter by department based on dashboard level and exclude folder placeholders
     let docQuery = db
       .from('documents')
       .select('id, file_size_bytes, type, uploaded_at, owner_user_id, department_id')
       .eq('org_id', orgId)
       .neq('type', 'folder'); // Exclude folder placeholder documents
 
-    if (!isOrgAdmin) {
+    // Filter based on dashboard permission level, not just role
+    if (!shouldShowOrgWideStats) {
       if (userDepartments.length > 0) {
         // User has departments - STRICT: only docs in their departments (NO unassigned access)
         docQuery = docQuery.in('department_id', userDepartments);
@@ -5309,9 +5465,9 @@ export function registerRoutes(app) {
       docDepartments: docStats?.map(d => d.department_id).filter((v, i, a) => a.indexOf(v) === i) || []
     });
 
-    // User stats - for admins show all, for others show department-specific
+    // User stats - for admin dashboard show all, for regular dashboard show department-specific
     let userStatsData;
-    if (isOrgAdmin) {
+    if (shouldShowOrgWideStats) {
       const { data: userStats, error: userErr } = await db
         .from('organization_users')
         .select('user_id, role, expires_at')
@@ -5350,9 +5506,9 @@ export function registerRoutes(app) {
       }
     }
 
-    // Recent activity (last 7 days)
+    // Recent activity (last 7 days) - filtered by dashboard level
     let recentActivity = [];
-    if (isOrgAdmin) {
+    if (shouldShowOrgWideStats) {
       const { data, error: activityErr } = await db
         .from('audit_events')
         .select('*')
@@ -5403,14 +5559,14 @@ export function registerRoutes(app) {
       recentActivity = filtered.slice(0, 10);
     }
 
-    // Chat sessions (last 30 days) - admins see all, users see their own
+    // Chat sessions (last 30 days) - admin dashboard sees all, regular dashboard sees their own
     let chatQuery = db
       .from('chat_sessions')
       .select('id, created_at, user_id')
       .eq('org_id', orgId)
       .gte('created_at', thirtyDaysAgo.toISOString());
 
-    if (!isOrgAdmin) {
+    if (!shouldShowOrgWideStats) {
       chatQuery = chatQuery.eq('user_id', userId);
     }
 
@@ -5545,12 +5701,30 @@ export function registerRoutes(app) {
   // Recycle Bin APIs
   app.get('/orgs/:orgId/recycle-bin', { preHandler: [app.verifyAuth, app.requireIpAccess] }, async (req) => {
     const orgId = await ensureActiveMember(req);
-    const perms = await getMyPermissions(req, orgId);
-    const canAdmin = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
-    if (!canAdmin) {
-      const err = new Error('Forbidden');
-      err.statusCode = 403;
-      throw err;
+    
+    // Get user's department context for permission checking
+    const userId = req.user?.sub;
+    const { data: userDepts } = await req.supabase
+      .from('department_users')
+      .select('department_id')
+      .eq('org_id', orgId)
+      .eq('user_id', userId);
+    
+    const userDeptIds = userDepts?.map(d => d.department_id) || [];
+    const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+    
+    // Check page permission (with fallback to old logic for backward compatibility)
+    try {
+      await ensurePerm(req, 'pages.recycle_bin', app, { departmentId: deptContext });
+    } catch {
+      // Fallback: check old permissions for backward compatibility
+      const perms = await getMyPermissions(req, orgId);
+      const canAdmin = !!(perms && (perms['org.manage_members'] || perms['documents.delete']));
+      if (!canAdmin) {
+        const err = new Error('Forbidden');
+        err.statusCode = 403;
+        throw err;
+      }
     }
     const nowIso = new Date().toISOString();
     const { data, error } = await app.supabaseAdmin

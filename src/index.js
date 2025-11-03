@@ -375,38 +375,39 @@ async function main() {
   app.post('/ops/fix/:orgId/seed-roles', { preHandler: [app.verifyAuth, app.requireIpAccess, app.ensurePlatformAdmin] }, async (req) => {
     const admin = app.supabaseAdmin;
     const { orgId } = req.params;
+    const { getCompleteRolePermissions } = await import('./lib/permission-helpers.js');
     const defaults = [
-      { key: 'orgAdmin', name: 'Organization Admin', is_system: true, permissions: {
+      { key: 'orgAdmin', name: 'Organization Admin', is_system: true, permissions: getCompleteRolePermissions({
         'org.manage_members': true, 'org.update_settings': true, 'security.ip_bypass': true,
         'documents.read': true, 'documents.create': true, 'documents.update': true, 'documents.delete': true,
         'documents.move': true, 'documents.link': true, 'documents.version.manage': true, 'documents.bulk_delete': true,
         'storage.upload': true, 'search.semantic': true, 'chat.save_sessions': true, 'audit.read': true,
-      } },
-      { key: 'contentManager', name: 'Content Manager', is_system: true, permissions: {
+      }) },
+      { key: 'contentManager', name: 'Content Manager', is_system: true, permissions: getCompleteRolePermissions({
         'org.manage_members': false, 'org.update_settings': false, 'security.ip_bypass': false,
         'documents.read': true, 'documents.create': true, 'documents.update': true, 'documents.delete': true,
         'documents.move': true, 'documents.link': true, 'documents.version.manage': true, 'documents.bulk_delete': true,
         'storage.upload': true, 'search.semantic': true, 'chat.save_sessions': true, 'audit.read': true,
-      } },
-      { key: 'teamLead', name: 'Team Lead', is_system: true, permissions: {
+      }) },
+      { key: 'teamLead', name: 'Team Lead', is_system: true, permissions: getCompleteRolePermissions({
         'org.manage_members': false, 'org.update_settings': false, 'security.ip_bypass': false,
         'documents.read': true, 'documents.create': true, 'documents.update': true, 'documents.delete': true,
         'documents.move': true, 'documents.link': true, 'documents.version.manage': true, 'documents.bulk_delete': false,
         'storage.upload': true, 'search.semantic': true, 'chat.save_sessions': false, 'audit.read': true,
         'departments.read': true, 'departments.manage_members': true,
-      } },
-      { key: 'member', name: 'Member', is_system: true, permissions: {
+      }) },
+      { key: 'member', name: 'Member', is_system: true, permissions: getCompleteRolePermissions({
         'org.manage_members': false, 'org.update_settings': false, 'security.ip_bypass': false,
         'documents.read': true, 'documents.create': true, 'documents.update': true, 'documents.delete': true,
         'documents.move': true, 'documents.link': true, 'documents.version.manage': true, 'documents.bulk_delete': false,
         'storage.upload': true, 'search.semantic': true, 'chat.save_sessions': false, 'audit.read': false,
-      } },
-      { key: 'contentViewer', name: 'Content Viewer', is_system: true, permissions: {
+      }) },
+      { key: 'contentViewer', name: 'Content Viewer', is_system: true, permissions: getCompleteRolePermissions({
         'org.manage_members': false, 'org.update_settings': false, 'security.ip_bypass': false,
         'documents.read': true, 'documents.create': false, 'documents.update': false, 'documents.delete': false,
         'documents.move': false, 'documents.link': false, 'documents.version.manage': false, 'documents.bulk_delete': false,
         'storage.upload': false, 'search.semantic': true, 'chat.save_sessions': false, 'audit.read': true,
-      } },
+      }) },
     ];
     const rows = defaults.map((r) => ({ org_id: orgId, key: r.key, name: r.name, is_system: r.is_system, permissions: r.permissions }));
     const { error } = await admin.from('org_roles').upsert(rows, { onConflict: 'org_id,key' });

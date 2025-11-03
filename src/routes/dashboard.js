@@ -1,6 +1,8 @@
 // Dashboard-specific routes
 // Contains APIs for admin team stats and team lead member stats
 
+import { getEffectivePermissions } from '../routes.js';
+
 // Cache key: userId; value: { email, displayName, expiresAt }
 const ADMIN_USER_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const adminUserCache = new Map();
@@ -68,7 +70,26 @@ export function registerDashboardRoutes(app) {
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
 
-    // Check if user is admin
+    // Check dashboard permission level instead of just role
+    let hasAdminDashboard = false;
+    try {
+      const { data: userDepts } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      const userDeptIds = userDepts?.map(d => d.department_id) || [];
+      const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+      
+      const permResult = await getEffectivePermissions(req, orgId, app, { departmentId: deptContext });
+      const permissions = permResult?.permissions || {};
+      const dashboardLevel = permissions['dashboard.view'] || 'regular';
+      hasAdminDashboard = dashboardLevel === 'admin';
+    } catch (error) {
+      console.warn('Failed to get effective permissions for dashboard teams, falling back to role check:', error);
+    }
+    
+    // Also check if user is orgAdmin (backward compatibility)
     const { data: userRole } = await db
       .from('organization_users')
       .select('role')
@@ -76,8 +97,11 @@ export function registerDashboardRoutes(app) {
       .eq('user_id', userId)
       .single();
 
-    if (userRole?.role !== 'orgAdmin') {
-      return { error: 'Access denied. Admin only.' };
+    const isOrgAdmin = userRole?.role === 'orgAdmin';
+    const canAccess = hasAdminDashboard || isOrgAdmin;
+
+    if (!canAccess) {
+      return { error: 'Access denied. Admin dashboard required.' };
     }
 
     // Get all departments except Core (which is restricted)
@@ -155,6 +179,29 @@ export function registerDashboardRoutes(app) {
     const db = req.supabase;
     const orgId = await ensureActiveMember(req);
     const userId = req.user?.sub;
+
+    // Check dashboard permission - if admin dashboard, don't show member cards (use teams endpoint instead)
+    let dashboardLevel = 'regular';
+    try {
+      const { data: userDeptsForPerm } = await db
+        .from('department_users')
+        .select('department_id')
+        .eq('org_id', orgId)
+        .eq('user_id', userId);
+      const userDeptIds = userDeptsForPerm?.map(d => d.department_id) || [];
+      const deptContext = userDeptIds.length > 0 ? userDeptIds[0] : null;
+      
+      const permResult = await getEffectivePermissions(req, orgId, app, { departmentId: deptContext });
+      const permissions = permResult?.permissions || {};
+      dashboardLevel = permissions['dashboard.view'] || 'regular';
+    } catch (error) {
+      console.warn('Failed to get effective permissions for dashboard members, falling back to role check:', error);
+    }
+    
+    // If user has admin dashboard, they should use /dashboard/teams endpoint instead
+    if (dashboardLevel === 'admin') {
+      return { error: 'Admin dashboard users should use /dashboard/teams endpoint instead.' };
+    }
 
     // Get user's departments where they are team lead
     const { data: userDepts, error: deptError } = await db
